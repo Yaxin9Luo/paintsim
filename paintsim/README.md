@@ -395,6 +395,8 @@ This page is where a paint is tuned. Add a recipe to `paintsim.recipes.js`, give
 
 ## The magpie
 
+The subject and its prompt come from a post by hallie iris ([@irisfIowers](https://x.com/irisfIowers/status/2119934629658370237)), whose image was made with Midjourney; that image was not copied. Here the model paints the picture itself.
+
 `paintings/magpie.json` is the library used in earnest: *a magpie perched in the margin of a medieval manuscript page, holding a pen nib in its beak*. About 11,000 marks in 18 stages, 1.3 MB of JSON, painted in about 8 seconds at 2000 × 2000 pixels in Node.
 
 ```bash

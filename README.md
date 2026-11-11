@@ -77,6 +77,14 @@ python3 -m http.server 8765   # then open http://localhost:8765/play.html?doc=pa
 - The generators of the finished paintings are in this repository. A model that can read this repository has seen them, so treat these five tasks as examples, not as a held-out test.
 - There is no scoring procedure yet beyond people looking at the pictures.
 
+## Credit
+
+The magpie began with a post by **hallie iris** ([@irisfIowers](https://x.com/irisfIowers/status/2119934629658370237)): an image of a magpie in a manuscript margin holding a pen nib, made with Midjourney from a prompt written by Fable 5.2. The idea, the prompt and that image are theirs. The image is not in this repository, and it was not copied or traced; it was used only as a mark of the quality to aim for.
+
+What is different here is how the picture is made. In that post an image model made the picture from a prompt. Here no image model is involved: the language model itself composes the picture and paints it, stroke by stroke, with the simulator, and looks at its own canvas to correct it.
+
+The other subjects (harbour, rainy street, birches, peonies, lemons) were written for this project.
+
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT for the code and the paintings made here. See [LICENSE](LICENSE). This does not cover the post credited above.
