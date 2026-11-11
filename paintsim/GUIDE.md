@@ -61,6 +61,11 @@ Put `dry()` between layers that must not mix. Give each stage a name and a note.
 - Print what your mixes give before you use them: `PaintSim.hex(PaintSim.color({mix: {…}}))`.
 - Mixing a yellow or an orange with a blue-violet to make a shadow gives green or olive, because that is what those pigments do. For a shadow colour, move the local colour toward one chosen shadow colour with the plain interpolation (`mixc` in the starter).
 - Give every stroke a slightly different colour: interpolate between two palette colours by position, by light, and by chance.
+- A stroke has one colour along its length (`color2` varies it across the brush). To shade along a curved form, cut the stroke into short pieces.
+- Do not sort the strokes of a passage from dark to light: the last stroke wins where strokes overlap, so the passage ends up too light. Keep them in random order.
+- A dark stroke laid into a wet pale layer comes out far lighter than its paint, because white dominates a mix. Dry the pale layer first.
+- White with raw umber or cobalt blue goes greenish. For a cool grey use ivory black with a little rose madder.
+- The colour on the picture is lighter than the paint if the light has `exposure` above 1. Mix shadows darker than they look on the palette.
 - `PaintSim.mix` and `PaintSim.color` do not check their input. A wrong value gives a near-black or `#NaNNaNNaN`; `PaintSim.check` reports the second, not the first.
 
 ## 8. Relief and light
@@ -72,11 +77,17 @@ Put `dry()` between layers that must not mix. Give each stage a name and a note.
 - `raking` shows brushwork best. `gallery` flattens it. Compare before you choose. `shoulder: .3` keeps bright lights from clipping to white.
 - A lens (`vignette`, a little `contrast`, `grain`) helps most pictures. Blur is for close-up photographs only.
 - `spray` makes separate droplets, not mist. For a glow, paint short strokes wet into wet and soften them with the `blender`.
+- A large glossy area gets a broad sheen under `raking` and looks much lighter than its colour. Keep gloss at .2 to .45 on big shapes, and look at the picture with `--light flat` to see the colours without the lamp.
+- Brush ridges that run across the direction of the light show strongly. A smooth thing (a glazed pot) painted with strokes looks fluted: lay it in with soft fills clipped to its shape and a levelled paint (`level: .9`).
+- Thickness does not pile up. Paint over paint takes the thickness of the last layer.
+- `--light NAME` replaces the whole light of the document, its exposure and lens included.
 
 ## 9. Edges
 
 - End strokes at the edge of a shape with `run(path, ok)`. The edge then looks painted. A clip mask gives a hard, cut edge; use it for hard things (a bill, a window bar, a hull).
 - `clip` takes a name from `shapes`. Named masks are made once, so they are cheap.
+- A stroke is as wide beyond its path as on it: a path that stops at an edge still paints half its width past it. For a crisp object, clip every stroke to its shape; for a soft one, lift.
+- Fills laid side by side in a grid show their blocks even with a large `soft`. Scattered soft ellipses give a smooth field.
 
 ## 10. Why a picture looks digital
 
@@ -93,6 +104,7 @@ Check each of these before you stop:
 ## 11. Limits
 
 - Keep the document under about 3 MB and the render at 2× under about 40 seconds. Round coordinates to one decimal.
+- A coordinate that is not a number is reported as `point N is not [x, y]`. Look for a NaN in your own arithmetic.
 - At most 255 different flake recipes on one surface.
 - Do not change the engine to make a picture work. If something in it is wrong, say so.
 

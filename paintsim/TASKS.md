@@ -54,6 +54,24 @@ Goal: a reusable paint simulator. Any model, any picture: paint is data, brushes
 - [x] Found and fixed on the way: a stroke's accidents depended on the scale (each stroke now has a random stream of its own; test added); sprays were about `scale²` denser at a larger scale (now per page area; `spray` density recalibrated to look the same at 2×; test added)
 - [x] Checked: 12 headless tests pass; browser and Node give the same fingerprint for the magpie at 2×; the standalone page loads nothing else
 
+## Round 7: more paintings, and the tasks
+- [x] Five oil paintings: `birches`, `harbour`, `rain`, `peonies`, `lemons` (the last four by separate agents from a long brief)
+- [x] `GUIDE.md`, from what those agents had to find out for themselves; `paintings/starter.gen.mjs`
+- [x] `bench/`: the five prompts, the task text, the kit builder
+- [x] One run from the task text alone (harbour): sound document, engine untouched; see `bench/runs/harbour-short-task/`
+- [ ] The same for a hard subject (peonies or lemons), and harbour a second time, to see the spread
+- [ ] A scoring procedure; held-out prompts that are not in this repository; a sandbox, so that a run cannot read outside its kit
+- [ ] Smaller preview images for the README (the PNGs are 7 to 9 MB each)
+
+## Reported by the painting agents (not yet acted on)
+- [ ] `tools/render.mjs --crop` paints the whole picture and prints the fingerprint of the whole picture, not of the file it writes
+- [ ] `PaintSim.mix` / `PaintSim.color` accept a value that is not a colour and return near-black or NaN without an error
+- [ ] `check` reports a NaN coordinate as "point N is not [x, y]"
+- [ ] The README does not list `PaintSim.util` (`arc`, `spline`, `fbm`, …) or say which side `grad` puts `color2` on
+- [ ] Thickness does not build up layer on layer (`HT` is replaced, not added to)
+- [ ] `varnish` flattens relief visibly even when thin
+- [ ] Techniques that each agent wrote for itself and that belong in a library: reflections in water (mirror sampler, broken slabs, wavering mast lines, glitter path); a one-point-perspective street with a field of reflected lights; a halo round a lamp; a turned vessel (surface of revolution) with decoration mapped onto it; cloth from fold curves; an ellipsoid painter; a 3-D ribbon (peel); a flower head built from cupped petals; a folded leaf; a value-only preview without painting; a separate random stream for each part of a generator
+
 ## Found on the way (not scheduled)
 - [ ] A lens with a tilted focal plane (today: blur by distance from one point)
 - [ ] Soft-edged clip in a painting document (today a clip is a hard shape; the magpie lifts strokes at the edge instead)
