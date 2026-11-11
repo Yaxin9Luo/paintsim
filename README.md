@@ -76,3 +76,7 @@ python3 -m http.server 8765   # then open http://localhost:8765/play.html?doc=pa
 - Five tasks. Four have a finished painting here (the fifth, the lemons, is being painted; the magpie is not one of the tasks). Those paintings were made with longer instructions than the task text in `bench/TASK.md`; a run with the short task text is in progress.
 - The generators of the finished paintings are in this repository. A model that can read this repository has seen them, so treat these five tasks as examples, not as a held-out test.
 - There is no scoring procedure yet beyond people looking at the pictures.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
