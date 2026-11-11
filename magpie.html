@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Magpie Marginalia</title>
+<style>
+  html,body{margin:0;height:100%;background:#191715;color:#cfc4ae;font:13px/1.4 Georgia,'Times New Roman',serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+  canvas{width:min(calc(100vh - 70px),94vw,1100px);aspect-ratio:1;border-radius:3px;box-shadow:0 10px 40px rgba(0,0,0,.6);background:#e6d8b8}
+  .bar{display:flex;gap:10px;align-items:center}
+  button{font:inherit;color:#e8dcc2;background:#2c2823;border:1px solid #4a4237;border-radius:4px;padding:5px 12px;cursor:pointer}
+  button:hover{background:#3a342c}
+  #st{min-width:230px;opacity:.75}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="bar">
+  <button id="replay">Repaint</button>
+  <button id="skip">Skip to finished</button>
+  <button id="save">Save PNG</button>
+  <span id="st"></span>
+</div>
+<script>
+(()=>{
+'use strict';
+/* =====================================================================
+   A small physical paint simulator.
+   Every brush stroke is a bundle of individual bristles. Each bristle
+   carries its own colour and paint load, deposits pigment AND thickness,
+   runs dry on the tooth of the vellum, and can pick up wet colour beneath
+   it. The finished relief is then photographed under a raking light, so
+   ridges of paint, raised gold leaf and metallic flakes catch the light.
+   Nothing here is traced from an image: the picture is built stroke by
+   stroke from geometry written below.
+   ===================================================================== */
+const qs=new URLSearchParams(location.search);
+const W=Math.max(256,Math.min(4096,(+qs.get('res')||(navigator.deviceMemory&&navigator.deviceMemory<4?1400:2048))|0)),H=W,S=W/1000,N=W*H,HS=S/2.048;
+const cv=document.getElementById('c');cv.width=W;cv.height=H;
+const ctx=cv.getContext('2d'),st=document.getElementById('st');
+
+/* ---------- random + noise ---------- */
+let seed=1;
+function rnd(){seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}
+const R=(a,b)=>a+rnd()*(b-a),pick=a=>a[Math.floor(rnd()*a.length)];
+function hash(x,y){let h=Math.imul(x,374761393)+Math.imul(y,668265263)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296}
+function vnoise(x,y){const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi,u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+  const a=hash(xi,yi),b=hash(xi+1,yi),c=hash(xi,yi+1),d=hash(xi+1,yi+1);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v}
+function fbm(x,y,o=4){let s=0,a=.5,f=1;for(let i=0;i<o;i++){s+=a*vnoise(x*f,y*f);a*=.5;f*=2}return s/(1-Math.pow(.5,o))}
+const smooth=t=>t<=0?0:t>=1?1:t*t*(3-2*t),clamp=(v,a,b)=>v<a?a:v>b?b:v,lerp=(a,b,t)=>a+(b-a)*t;
+const mix=(a,b,t)=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];
+function hsv(h,s,v){h=((h%360)+360)%360/60;const i=Math.floor(h),f=h-i,p=v*(1-s),qq=v*(1-s*f),t=v*(1-s*(1-f));
+  return i===0?[v,t,p]:i===1?[qq,v,p]:i===2?[p,v,t]:i===3?[p,qq,v]:i===4?[t,p,v]:[v,p,qq]}
+
+/* ---------- the painting surface ---------- */
+const F=()=>new Float32Array(N);
+const CR=F(),CG=F(),CB=F();      // pigment colour
+const HT=F();                    // paint thickness (relief)
+const SP=F(),MT=F(),IR=F(),IH=F(); // gloss, gold-leaf, iridescent flake amount + hue
+const PAPER=F(),HB=F();          // tooth of the vellum, working height buffer
+const sW=F(),sR=F(),sG=F(),sBl=F(),sL=F(),sH=F(),sU=F(); // scratch layer for the stroke being painted
+const touched=new Int32Array(N);
+const OUT=new ImageData(W,H);
+const TS=64,TW=Math.ceil(W/TS),dirty=new Uint8Array(TW*TW);
+function markDirty(x0,y0,x1,y1){if(x1<0||y1<0||x0>=W||y0>=H)return;
+  const a=Math.max(0,(x0-12)/TS|0),b=Math.max(0,(y0-12)/TS|0),c=Math.min(TW-1,(x1+12)/TS|0),d=Math.min(TW-1,(y1+12)/TS|0);
+  for(let j=b;j<=d;j++)for(let i=a;i<=c;i++)dirty[j*TW+i]=1}
+
+/* ---------- op queue ---------- */
+let Q=[],stageName='';const q=f=>Q.push(f),stage=n=>q(()=>{stageName=n});
+function batch(items,per,fn){for(let i=0;i<items.length;i+=per){const sl=items.slice(i,i+per);q(()=>{for(const it of sl)fn(it)})}}
+
+/* ---------- geometry ---------- */
+function cr(p0,p1,p2,p3,t){const t2=t*t,t3=t2*t;return .5*((2*p1)+(-p0+p2)*t+(2*p0-5*p1+4*p2-p3)*t2+(-p0+3*p1-3*p2+p3)*t3)}
+function spline(p,seg=10,closed=false){const n=p.length,o=[];const g=i=>closed?p[(i+n)%n]:p[clamp(i,0,n-1)];const m=closed?n:n-1;
+  for(let i=0;i<m;i++){const a=g(i-1),b=g(i),c=g(i+1),d=g(i+2);for(let j=0;j<seg;j++){const t=j/seg;o.push([cr(a[0],b[0],c[0],d[0],t),cr(a[1],b[1],c[1],d[1],t)])}}
+  if(!closed)o.push(p[n-1].slice());return o}
+function bbox(p){let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;for(const a of p){if(a[0]<x0)x0=a[0];if(a[1]<y0)y0=a[1];if(a[0]>x1)x1=a[0];if(a[1]>y1)y1=a[1]}return{x0,y0,x1,y1,w:x1-x0,h:y1-y0}}
+function arc(x,y,ang,len,curv=0,n=6){const p=[[x,y]];let a=ang-curv/2;const s=len/n;for(let i=0;i<n;i++){a+=curv/n;x+=Math.cos(a)*s;y+=Math.sin(a)*s;p.push([x,y])}return p}
+function circleArc(cx,cy,r,a0,a1,n=16){const p=[];for(let i=0;i<=n;i++){const a=a0+(a1-a0)*i/n;p.push([cx+Math.cos(a)*r,cy+Math.sin(a)*r])}return p}
+function tipArc(sx,sy,ang,len,wid,t0,t1){const ca=Math.cos(ang),sa=Math.sin(ang),cx=sx+ca*len*.66,cy=sy+sa*len*.66,ra=len*.34,rb=wid*.5,p=[];
+  for(let i=0;i<=10;i++){const th=t0+(t1-t0)*i/10,a=ra*Math.cos(th),b=rb*Math.sin(th);p.push([cx+ca*a-sa*b,cy+sa*a+ca*b])}return p}
+const rect=(x0,y0,x1,y1)=>[[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+function blob(cx,cy,r,n=11,irr=.3){const p=[];for(let i=0;i<n;i++){const a=i/n*6.283,rr=r*(1+R(-irr,irr));p.push([cx+Math.cos(a)*rr,cy+Math.sin(a)*rr])}return spline(p,5,true)}
+function local(pts,x,y,ang,s){const c=Math.cos(ang),n=Math.sin(ang);return pts.map(p=>[x+(p[0]*c-p[1]*n)*s,y+(p[0]*n+p[1]*c)*s])}
+function tendril(x,y,ang,len,k0,k1){const p=[[x,y]],s=4;for(let d=0;d<len;d+=s){const t=d/len;ang+=(k0+(k1-k0)*t*t)*s;x+=Math.cos(ang)*s;y+=Math.sin(ang)*s;p.push([x,y])}return p}
+function distPoly(x,y,P){let d=1e18;for(let i=0;i<P.length-1;i++){const ax=P[i][0],ay=P[i][1],vx=P[i+1][0]-ax,vy=P[i+1][1]-ay,t=clamp(((x-ax)*vx+(y-ay)*vy)/(vx*vx+vy*vy),0,1),dx=x-ax-vx*t,dy=y-ay-vy*t,dd=dx*dx+dy*dy;if(dd<d)d=dd}return Math.sqrt(d)}
+const hctx=document.createElement('canvas').getContext('2d');
+const toPath=poly=>{const h=new Path2D();poly.forEach((p,i)=>i?h.lineTo(p[0],p[1]):h.moveTo(p[0],p[1]));h.closePath();return h};
+function sampleIn(poly,n){const path=toPath(poly),b=bbox(poly),out=[];let guard=0;
+  while(out.length<n&&guard++<n*80){const x=R(b.x0,b.x1),y=R(b.y0,b.y1);if(hctx.isPointInPath(path,x,y))out.push([x,y])}return out}
+// blue-noise scatter with a radius that varies over the shape (small feathers on the face, large on the body)
+function poisson(poly,rf,rmin,rmax){const path=toPath(poly),b=bbox(poly),cell=rmax,grid=new Map(),out=[],M=Math.ceil(b.w*b.h/(rmin*rmin)*9);
+  for(let i=0;i<M;i++){const x=R(b.x0,b.x1),y=R(b.y0,b.y1);if(!hctx.isPointInPath(path,x,y))continue;const r=rf(x,y),gx=Math.floor(x/cell),gy=Math.floor(y/cell);let ok=true;
+    for(let a=gx-1;a<=gx+1&&ok;a++)for(let c=gy-1;c<=gy+1&&ok;c++){const g=grid.get(a*8192+c);if(g)for(const p of g){const dx=p[0]-x,dy=p[1]-y;if(dx*dx+dy*dy<r*r){ok=false;break}}}
+    if(ok){out.push([x,y]);const key=gx*8192+gy;let g=grid.get(key);if(!g){g=[];grid.set(key,g)}g.push([x,y])}}
+  return out}
+
+/* =====================================================================
+   BRISTLE BRUSH
+   ===================================================================== */
+const STEP=.75,MAXP=30000,rx=new Float32Array(MAXP),ry=new Float32Array(MAXP),rnx=new Float32Array(MAXP),rny=new Float32Array(MAXP);
+const MAXB=700,bu=new Float32Array(MAXB),bR=new Float32Array(MAXB),bG=new Float32Array(MAXB),bBl=new Float32Array(MAXB),bL=new Float32Array(MAXB),bH=new Float32Array(MAXB),bS=new Float32Array(MAXB),bE=new Float32Array(MAXB),bPh=new Int32Array(MAXB);
+const NTAB=new Float32Array(1024);for(let i=0;i<1024;i++)NTAB[i]=vnoise(i/26,3.7);
+// pressure curves: how hard the brush is pressed along the stroke (0 start → 1 end)
+const PROF={
+  leaf:t=>Math.pow(Math.sin(Math.PI*Math.pow(t,1.25)),.75),
+  feather:t=>Math.pow(Math.sin(Math.PI*Math.min(1,Math.pow(t,1.5))),.5),
+  taper:t=>Math.pow(Math.sin(Math.PI*t),.55),
+  comma:t=>smooth(t/.08)*Math.pow(1-t,.75),
+  hair:t=>smooth(t/.06)*Math.pow(1-t,.8),
+  flat:t=>smooth(t/.04)*smooth((1-t)/.04),
+  pen:t=>smooth(t/.05)*smooth((1-t)/.1)*(.8+.2*Math.sin(Math.PI*t))
+};
+function resampleInto(P){let n=1,px=P[0][0]*S-.5,py=P[0][1]*S-.5,need=STEP;rx[0]=px;ry[0]=py;
+  for(let i=1;i<P.length&&n<MAXP;i++){const bx=P[i][0]*S-.5,by=P[i][1]*S-.5;let ax=px,ay=py,seg=Math.hypot(bx-ax,by-ay);
+    while(seg>=need&&n<MAXP){const f=need/seg;ax+=(bx-ax)*f;ay+=(by-ay)*f;rx[n]=ax;ry[n]=ay;n++;seg-=need;need=STEP}
+    need-=seg;px=bx;py=by}
+  for(let j=0;j<n;j++){const a=j>2?j-3:0,b=j<n-3?j+3:n-1,dx=rx[b]-rx[a],dy=ry[b]-ry[a],l=Math.hypot(dx,dy)||1;rnx[j]=-dy/l;rny[j]=dx/l}
+  return n}
+/* stroke(points, options) — units are page units (the page is 1000 wide)
+   w width · col/col2 the one or two colours loaded on the brush · grad/gradN how the two are spread across the bristles
+   prof pressure curve · flat: flat brush (constant width) · a opacity · thick relief · dry dry-brush breakup on the vellum tooth
+   load distance the paint lasts · pick wet pick-up of the colour beneath · mode 'glaze' = transparent wash
+   spec gloss · metal gold · irid/hue metallic flake · clip mask · tone2 lighten/darken toward the tip */
+function stroke(P,o){
+  if(!P||P.length<2)return;
+  let src=P;if(o.spline!==false&&P.length>2&&P.length<40)src=spline(P,o.seg||8);
+  const n=resampleInto(src);if(n<2)return;
+  const w=Math.max(.7,o.w*S),len=(n-1)*STEP,prof=typeof o.prof==='function'?o.prof:PROF[o.prof||'taper'],flat=!!o.flat,press=o.press??1;
+  const nb=Math.min(MAXB,Math.max(1,Math.round(w)));
+  const c1=o.col,c2=o.col2||c1,two=!!o.col2,jit=o.jit??.05,streak=o.streak??.1,grad=o.grad??0,gradN=o.gradN??.5;
+  const thick=o.thick??.5,edge=o.edge??0,taperH=o.taperH??.72,vary=o.vary??.1,wet=o.wet??1.15,invLoad=o.load?1/(o.load*S):0,pick=o.pick??0,rag=(o.rag??0)*S;
+  const cfreq=Math.max(1.2,w/((o.clump??3)*S)),su=rnd()*999,sv=rnd()*999,varA=o.var??0,wob=(o.wob??0)*S,tone2=o.tone2??0;
+  const ffreq=w/3.3,sf2=rnd()*999,kkn=26/((o.varLen??9)*S);
+  for(let i=0;i<nb;i++){const u=nb>1?((i+.5+(rnd()-.5)*.3)/nb)*2-1:0,uu=u*.5+.5,cl=vnoise(su+uu*cfreq,7.7),fn=vnoise(sf2+uu*ffreq,2.2),tone=1+(cl-.5)*2*streak+(fn-.5)*2*jit;
+    const m=two?clamp(.5+.5*u*grad+(cl-.5)*2*gradN,0,1):0,au=u<0?-u:u;
+    bu[i]=u;bR[i]=(c1[0]+(c2[0]-c1[0])*m)*tone;bG[i]=(c1[1]+(c2[1]-c1[1])*m)*tone;bBl[i]=(c1[2]+(c2[2]-c1[2])*m)*tone;
+    bL[i]=wet*(.72+.56*cl)*(.85+.3*rnd());
+    bH[i]=thick*(.45+1.1*cl+(fn-.5)*.4)*(1-taperH*smooth((au-.5)/.5))+edge*thick*Math.exp(-Math.pow((au-.78)/.12,2));
+    bPh[i]=(vnoise(sf2+uu*cfreq*.8,5.1)*900)|0;
+    bS[i]=rag*rnd();bE[i]=len-rag*rnd()}
+  let x0=1e9,y0=1e9,x1=-1,y1=-1,nT=0;
+  for(let j=0;j<n;j++){const t=j/(n-1);let p=prof(t)*press;if(varA)p*=1+varA*(vnoise(su+j*STEP/(9*S),3.3)-.5)*2;if(!(p>.012))continue;if(p>1)p=1;
+    const dist=j*STEP,hw=flat?w*.5:Math.max(.3,w*.5*p),pa=flat?p:(p*4>1?1:p*4),dl=dist*invLoad,tt=tone2?1+tone2*(t-.35):1;
+    const di=(dist*kkn)|0,hp=.35+.65*p;
+    let cx=rx[j],cy=ry[j];const nx=rnx[j],ny=rny[j];
+    if(wob){const wv=(vnoise(sv+dist/(14*S),8.1)-.5)*2*wob;cx+=nx*wv;cy+=ny*wv}
+    for(let i=0;i<nb;i++){if(dist<bS[i]||dist>bE[i])continue;let L=bL[i]-dl;if(L<=0)continue;if(L>1)L=1;
+      const u=bu[i],x=cx+nx*u*hw,y=cy+ny*u*hw;if(x<0||y<0)continue;const ix=x|0,iy=y|0;if(ix>=W-1||iy>=H-1)continue;
+      const k=iy*W+ix;
+      if(pick>0){bR[i]+=(CR[k]-bR[i])*pick;bG[i]+=(CG[k]-bG[i])*pick;bBl[i]+=(CB[k]-bBl[i])*pick}
+      const md=NTAB[(di+bPh[i])&1023],tv=tt*(1+(md-.5)*2*vary),fx=x-ix,fy=y-iy,r=bR[i]*tv,g=bG[i]*tv,b=bBl[i]*tv,hh=bH[i]*(.5+.5*L)*hp*(.6+.8*md),au=u<0?-u:u;
+      let wt=(1-fx)*(1-fy)*pa,kk=k;
+      if(wt>0){if(sW[kk]===0)touched[nT++]=kk;sW[kk]+=wt;sR[kk]+=wt*r;sG[kk]+=wt*g;sBl[kk]+=wt*b;sL[kk]+=wt*L;sH[kk]+=wt*hh;sU[kk]+=wt*au}
+      wt=fx*(1-fy)*pa;kk=k+1;
+      if(wt>0){if(sW[kk]===0)touched[nT++]=kk;sW[kk]+=wt;sR[kk]+=wt*r;sG[kk]+=wt*g;sBl[kk]+=wt*b;sL[kk]+=wt*L;sH[kk]+=wt*hh;sU[kk]+=wt*au}
+      wt=(1-fx)*fy*pa;kk=k+W;
+      if(wt>0){if(sW[kk]===0)touched[nT++]=kk;sW[kk]+=wt;sR[kk]+=wt*r;sG[kk]+=wt*g;sBl[kk]+=wt*b;sL[kk]+=wt*L;sH[kk]+=wt*hh;sU[kk]+=wt*au}
+      wt=fx*fy*pa;kk=k+W+1;
+      if(wt>0){if(sW[kk]===0)touched[nT++]=kk;sW[kk]+=wt;sR[kk]+=wt*r;sG[kk]+=wt*g;sBl[kk]+=wt*b;sL[kk]+=wt*L;sH[kk]+=wt*hh;sU[kk]+=wt*au}
+      if(ix<x0)x0=ix;if(ix>x1)x1=ix;if(iy<y0)y0=iy;if(iy>y1)y1=iy}}
+  if(!nT)return;
+  // lay the finished stroke onto the page in one go
+  const A=o.a??1,dry=o.dry??.3,glaze=o.mode==='glaze',spec=o.spec??.1,metal=o.metal??0,irid=o.irid??0,hue=o.hue??0,rim=o.rim??.5,gran=o.gran??.3,clip=o.clip||null;
+  for(let i=0;i<nT;i++){const k=touched[i],ws=sW[k],inv=1/ws,L=sL[k]*inv;let cov=ws*1.15;if(cov>1)cov=1;let a=cov*A;
+    if(dry>0){const f=(L-(1-PAPER[k])*dry)*3.5;if(f<1)a=f<=0?0:a*f*f*(3-2*f)}else if(L<.25)a*=L*4;
+    if(clip&&a>0){const x=k%W,y=(k-x)/W,mx=x-clip.x0,my=y-clip.y0;a*=(mx>=0&&my>=0&&mx<clip.w&&my<clip.h)?clip.a[my*clip.w+mx]:0}
+    if(a>0){const r=sR[k]*inv,g=sG[k]*inv,b=sBl[k]*inv;
+      if(glaze){const u=sU[k]*inv;let ga=a*(1+rim*smooth((u-.6)/.4)+gran*(.5-PAPER[k])*2);if(ga>1)ga=1;if(ga<0)ga=0;
+        CR[k]*=1-ga*(1-r);CG[k]*=1-ga*(1-g);CB[k]*=1-ga*(1-b)}
+      else{CR[k]+=(r-CR[k])*a;CG[k]+=(g-CG[k])*a;CB[k]+=(b-CB[k])*a;
+        HT[k]=HT[k]*(1-.5*a)+a*sH[k]*inv;SP[k]+=(spec-SP[k])*a;MT[k]+=(metal-MT[k])*a;IR[k]+=(irid-IR[k])*a;if(irid>0&&a>.25)IH[k]=hue}}
+    sW[k]=0;sR[k]=0;sG[k]=0;sBl[k]=0;sL[k]=0;sH[k]=0;sU[k]=0}
+  markDirty(x0,y0,x1+1,y1+1)}
+
+// a single round touch of paint (dots, the eye, a bead of ink)
+function disc(xd,yd,rd,col,o={}){const x=xd*S-.5,y=yd*S-.5,r=rd*S,a0=o.a??1,soft=Math.max(.9,(o.soft??.12)*r),glaze=o.mode==='glaze',thick=o.thick??0;
+  const x0=Math.max(0,Math.floor(x-r-2)),x1=Math.min(W-1,Math.ceil(x+r+2)),y0=Math.max(0,Math.floor(y-r-2)),y1=Math.min(H-1,Math.ceil(y+r+2));
+  for(let py=y0;py<=y1;py++)for(let px=x0;px<=x1;px++){const d=Math.hypot(px-x,py-y);let a=(r-d)/soft+.5;if(a<=0)continue;if(a>1)a=1;a*=a0;const k=py*W+px;
+    if(glaze){CR[k]*=1-a*(1-col[0]);CG[k]*=1-a*(1-col[1]);CB[k]*=1-a*(1-col[2])}
+    else{CR[k]+=(col[0]-CR[k])*a;CG[k]+=(col[1]-CG[k])*a;CB[k]+=(col[2]-CB[k])*a;
+      if(thick){const q2=d/r;HT[k]=HT[k]*(1-a)+a*(o.base??0)+a*thick*Math.sqrt(q2<1?1-q2*q2:0)}
+      if(o.spec!==undefined)SP[k]+=(o.spec-SP[k])*a;MT[k]*=1-a;IR[k]*=1-a}}
+  markDirty(x0,y0,x1,y1)}
+
+/* ---------- soft masks for washes and gilding (shapes rasterised, then blurred) ---------- */
+const MC=document.createElement('canvas'),mx2=MC.getContext('2d',{willReadFrequently:true});
+function maskDraw(bb,draw,pad=3){const x0=Math.max(0,Math.floor(bb.x0*S-pad)),y0=Math.max(0,Math.floor(bb.y0*S-pad)),x1=Math.min(W,Math.ceil(bb.x1*S+pad)),y1=Math.min(H,Math.ceil(bb.y1*S+pad)),w=x1-x0,h=y1-y0;
+  if(w<=0||h<=0)return null;MC.width=w;MC.height=h;mx2.setTransform(S,0,0,S,-x0,-y0);mx2.fillStyle='#fff';mx2.strokeStyle='#fff';draw(mx2);
+  const d=mx2.getImageData(0,0,w,h).data,a=new Float32Array(w*h);for(let i=0,n=w*h;i<n;i++)a[i]=d[i*4+3]/255;return{x0,y0,w,h,a}}
+function polyMask(polys,pad=3){let b={x0:1e9,y0:1e9,x1:-1e9,y1:-1e9};for(const p of polys){const c=bbox(p);b.x0=Math.min(b.x0,c.x0);b.y0=Math.min(b.y0,c.y0);b.x1=Math.max(b.x1,c.x1);b.y1=Math.max(b.y1,c.y1)}
+  return maskDraw(b,c=>{c.beginPath();for(const p of polys){c.moveTo(p[0][0],p[0][1]);for(let i=1;i<p.length;i++)c.lineTo(p[i][0],p[i][1]);c.closePath()}c.fill()},pad)}
+function boxH(s,d,w,h,r){const iw=1/(2*r+1);for(let y=0;y<h;y++){const o=y*w;let acc=0;for(let x=-r;x<=r;x++)acc+=s[o+(x<0?0:x>=w?w-1:x)];
+  for(let x=0;x<w;x++){d[o+x]=acc*iw;const a=x+r+1,b=x-r;acc+=s[o+(a<w?a:w-1)]-s[o+(b>0?b:0)]}}}
+function boxV(s,d,w,h,r){const iw=1/(2*r+1);for(let x=0;x<w;x++){let acc=0;for(let y=-r;y<=r;y++)acc+=s[(y<0?0:y>=h?h-1:y)*w+x];
+  for(let y=0;y<h;y++){d[y*w+x]=acc*iw;const a=y+r+1,b=y-r;acc+=s[(a<h?a:h-1)*w+x]-s[(b>0?b:0)*w+x]}}}
+function blurMask(m,r){const br=Math.max(1,Math.round(r)),t=new Float32Array(m.a.length);for(let i=0;i<3;i++){boxH(m.a,t,m.w,m.h,br);boxV(t,m.a,m.w,m.h,br)}return m}
+// watercolour wash: uneven pigment, darker drying rim, granulation into the tooth
+function wash(polys,col,o={}){q(()=>{const bl=(o.blur??1.6)*S,m=polyMask(polys,Math.ceil(bl*3)+4);if(!m)return;blurMask(m,bl);
+  const A=o.a??.3,gran=o.gran??.3,rim=o.rim??.35,un=o.uneven??.5,sc=o.scale??50,sx=rnd()*300,body=o.mode==='body',thick=o.thick??0,spec=o.spec??.05;
+  for(let j=0;j<m.h;j++)for(let i=0;i<m.w;i++){const mv=m.a[j*m.w+i];if(mv<.004)continue;const x=m.x0+i,y=m.y0+j,k=y*W+x;
+    let a=mv*A*(1-un*.5+un*fbm(x/S/sc+sx,y/S/sc,3))*(1+gran*(.5-PAPER[k])*2);
+    if(body){if(a>1)a=1;CR[k]+=(col[0]-CR[k])*a;CG[k]+=(col[1]-CG[k])*a;CB[k]+=(col[2]-CB[k])*a;if(thick)HT[k]=HT[k]*(1-.5*a)+a*thick;SP[k]+=(spec-SP[k])*a;MT[k]*=1-a;IR[k]*=1-a}
+    else{a+=rim*A*4*mv*(1-mv);if(a>1)a=1;CR[k]*=1-a*(1-col[0]);CG[k]*=1-a*(1-col[1]);CB[k]*=1-a*(1-col[2])}}
+  markDirty(m.x0,m.y0,m.x0+m.w,m.y0+m.h)})}
+function fillMask(m,col,o={}){if(!m)return;const A=o.a??1,thick=o.thick??.4,spec=o.spec??.1,un=o.uneven??.15,sx=rnd()*99;
+  for(let j=0;j<m.h;j++)for(let i=0;i<m.w;i++){let a=m.a[j*m.w+i];if(a<.01)continue;a*=A;const x=m.x0+i,y=m.y0+j,k=y*W+x,tn=1+un*(fbm(x/S/6+sx,y/S/6,2)-.5)*2;
+    CR[k]+=(col[0]*tn-CR[k])*a;CG[k]+=(col[1]*tn-CG[k])*a;CB[k]+=(col[2]*tn-CB[k])*a;HT[k]=HT[k]*(1-.5*a)+a*thick;SP[k]+=(spec-SP[k])*a;MT[k]*=1-a;IR[k]*=1-a}
+  markDirty(m.x0,m.y0,m.x0+m.w,m.y0+m.h)}
+function inkMask(m,col,A){for(let j=0;j<m.h;j++)for(let i=0;i<m.w;i++){const mv=m.a[j*m.w+i];if(mv<.01)continue;const x=m.x0+i,y=m.y0+j,k=y*W+x;
+    let a=mv*A*(.8+.34*fbm(x/S/9,y/S/9,2));if(a>1)a=1;CR[k]*=1-a*(1-col[0]);CG[k]*=1-a*(1-col[1]);CB[k]*=1-a*(1-col[2]);HT[k]+=a*.25;SP[k]+=(.3-SP[k])*a}
+  markDirty(m.x0,m.y0,m.x0+m.w,m.y0+m.h)}
+// gold leaf laid on a raised gesso cushion: domed edge, burnishing scratches, hairline wrinkles, worn spots of red bole
+function gild(poly,o={}){q(()=>{const domeR=(o.dome??2)*S,m=polyMask([poly],Math.ceil(domeR*3)+4);if(!m)return;
+  const dm=new Float32Array(m.a),dmm={a:dm,w:m.w,h:m.h};blurMask(dmm,domeR);
+  const hG=(o.h??3)*HS,dir=o.dir??1.3,cs=Math.cos(dir),sn=Math.sin(dir),tex=o.tex??.45,wearK=o.wear??1,sx=rnd()*500;
+  for(let j=0;j<m.h;j++)for(let i=0;i<m.w;i++){const a=m.a[j*m.w+i];if(a<.01)continue;const x=m.x0+i,y=m.y0+j,k=y*W+x,xd=x/S,yd=y/S,d=dm[j*m.w+i];
+    const u=xd*cs+yd*sn,v=-xd*sn+yd*cs,t=(vnoise(u/7+sx,v/.55)-.5)*.55+(vnoise(u/2.2,v/.3+9)-.5)*.3;
+    const crack=smooth(1-Math.abs(fbm(xd/13+sx,yd/13+8,3)-.5)/.007),wear=smooth((fbm(xd/6+40+sx,yd/6+2,3)+(1-d)*.2-.78)/.06)*wearK;
+    const tone=.92+.2*fbm(xd/22+sx,yd/22,2),r=lerp(.64*tone,.46,wear),g=lerp(.47*tone,.17,wear),b=lerp(.16*tone,.10,wear);
+    CR[k]+=(r-CR[k])*a;CG[k]+=(g-CG[k])*a;CB[k]+=(b-CB[k])*a;
+    HT[k]=HT[k]*(1-a)+a*(hG*smooth((d-.2)/.7)+t*tex-crack*.5-wear*.5);MT[k]+=((1-wear)-MT[k])*a;SP[k]+=(.5-SP[k])*a;IR[k]*=1-a}
+  markDirty(m.x0,m.y0,m.x0+m.w,m.y0+m.h)})}
+
+/* =====================================================================
+   LIGHTING — photograph the relief under a raking lamp from the upper left
+   ===================================================================== */
+const LV=(()=>{const x=-.56,y=-.66,z=.5,l=Math.hypot(x,y,z);return[x/l,y/l,z/l]})(),LX=LV[0],LY=LV[1],LZ=LV[2];
+const HV=(()=>{const x=LX,y=LY,z=LZ+1,l=Math.hypot(x,y,z);return[x/l,y/l,z/l]})(),HX=HV[0],HY=HV[1],HZ=HV[2];
+const KH=1,KP=.13,KB=1.15,KD=.5,KC=.08,KS=.2,SLOPE=.45,MG=12,W3=3*W;
+const L2=Math.hypot(LX,LY),TAPD=[1.5,3,5,7.5,10.5],TO=TAPD.map(d=>Math.round(LX/L2*d)+Math.round(LY/L2*d)*W),TD=TAPD.map(d=>d*SLOPE);
+function relight(x0,y0,x1,y1){
+  x0=Math.max(0,x0|0);y0=Math.max(0,y0|0);x1=Math.min(W-1,x1|0);y1=Math.min(H-1,y1|0);if(x1<x0||y1<y0)return;
+  const a0=Math.max(0,x0-MG),b0=Math.max(0,y0-MG),a1=Math.min(W-1,x1+MG),b1=Math.min(H-1,y1+MG);
+  for(let y=b0;y<=b1;y++){let k=y*W+a0;for(let x=a0;x<=a1;x++,k++){const t=HT[k];HB[k]=t*KH+PAPER[k]*KP/(1+2.5*(t>0?t:0))}}
+  const d=OUT.data,t0=TO[0],t1=TO[1],t2=TO[2],t3=TO[3],t4=TO[4],d0=TD[0],d1=TD[1],d2=TD[2],d3=TD[3],d4=TD[4];
+  for(let y=y0;y<=y1;y++){const ey=y<MG||y>=H-MG;let k=y*W+x0;
+    for(let x=x0;x<=x1;x++,k++){let r=CR[k],g=CG[k],b=CB[k];
+      if(!ey&&x>=MG&&x<W-MG){
+        const h=HB[k],gx=(HB[k+1]-HB[k-1])*.5*KB,gy=(HB[k+W]-HB[k-W])*.5*KB,il=1/Math.sqrt(gx*gx+gy*gy+1),nx=-gx*il,ny=-gy*il,nz=il;
+        let sd=1+KD*((nx*LX+ny*LY+nz*LZ)/LZ-1);if(sd<.4)sd=.4;else if(sd>1.7)sd=1.7;
+        let cvt=1+KC*(h-(HB[k-3]+HB[k+3]+HB[k-W3]+HB[k+W3])*.25);if(cvt<.8)cvt=.8;else if(cvt>1.2)cvt=1.2;
+        let sh=0,dd=HB[k+t0]-h-d0;if(dd>0)sh+=dd;dd=HB[k+t1]-h-d1;if(dd>0)sh+=dd;dd=HB[k+t2]-h-d2;if(dd>0)sh+=dd;dd=HB[k+t3]-h-d3;if(dd>0)sh+=dd;dd=HB[k+t4]-h-d4;if(dd>0)sh+=dd;
+        sh*=KS;if(sh>1)sh=1;
+        const lm=sd*cvt*(1-.5*sh),sp=SP[k],mt=MT[k],ir=IR[k];r*=lm;g*=lm;b*=lm;
+        if(sp>.04||mt>.01||ir>.01){const lit=1-.75*sh;let nh=nx*HX+ny*HY+nz*HZ;if(nh<0)nh=0;const n2=nh*nh,s0=n2*n2*nh,add=sp*(Math.pow(nh,44)*.5+s0*.06)*lit;r+=add;g+=add;b+=add;
+          if(mt>.01){ // gold: broad sheen that follows the cockle of the page, plus burnished glints
+            const xd=x/S,yd=y/S,cxn=(vnoise(xd/140+5,yd/140+2)-.5)*.5,cyn=(vnoise(xd/140+60,yd/140+33)-.5)*.5,h1=hash(x,y)-.5,h2=hash(x+7919,y+3571)-.5;
+            let ax=nx+cxn+h1*.14,ay=ny+cyn+h2*.14,al=1/Math.sqrt(ax*ax+ay*ay+nz*nz),mh=(ax*HX+ay*HY+nz*HZ)*al;if(mh<0)mh=0;const m2=mh*mh,w0=m2*m2,w1=Math.pow(mh,28);
+            ax=nx+cxn+h1;ay=ny+cyn+h2;al=1/Math.sqrt(ax*ax+ay*ay+nz*nz);let gh=(ax*HX+ay*HY+nz*HZ)*al;if(gh<0)gh=0;
+            const m0=(w0*.7+w1*.55+Math.pow(gh,110)*.6)*lit*mt,dk=1-.5*mt;r=r*dk+m0;g=g*dk+m0*.85;b=b*dk+m0*.5}
+          if(ir>.01){ // iridescent paint: tiny flakes, each flashing its own interference colour
+            const h1=hash(x+11,y+17)-.5,h2=hash(x+23,y+5)-.5;let ax=nx+h1*1.7,ay=ny+h2*1.7,al=1/Math.sqrt(ax*ax+ay*ay+nz*nz),fh=(ax*HX+ay*HY+nz*HZ)*al,sf=fh>0?Math.pow(fh,70):0;
+            const g1=hash((x>>1)+101,(y>>1)+77)-.5,g2=hash((x>>1)+5,(y>>1)+311)-.5;ax=nx+g1*2;ay=ny+g2*2;al=1/Math.sqrt(ax*ax+ay*ay+nz*nz);fh=(ax*HX+ay*HY+nz*HZ)*al;if(fh>0){const s2=Math.pow(fh,110);if(s2>sf)sf=s2}
+            let hh=(IH[k]+(hash(x+3,y+91)-.5)*90)/60;hh-=Math.floor(hh/6)*6;const hi=hh|0,hf=hh-hi,p_=.25,q_=1-.75*hf,t_=1-.75*(1-hf);
+            let fr,fg,fb;if(hi===0){fr=1;fg=t_;fb=p_}else if(hi===1){fr=q_;fg=1;fb=p_}else if(hi===2){fr=p_;fg=1;fb=t_}else if(hi===3){fr=p_;fg=q_;fb=1}else if(hi===4){fr=t_;fg=p_;fb=1}else{fr=1;fg=p_;fb=q_}
+            const am=ir*lit*(sf*1.25+s0*.3);r+=fr*am;g+=fg*am;b+=fb*am}}}
+      const o=k<<2;d[o]=r>=1?255:r<=0?0:(r*255+.5)|0;d[o+1]=g>=1?255:g<=0?0:(g*255+.5)|0;d[o+2]=b>=1?255:b<=0?0:(b*255+.5)|0;d[o+3]=255}}
+  ctx.putImageData(OUT,0,0,x0,y0,x1-x0+1,y1-y0+1)}
+function flushDirty(max){let c=0;for(let j=0;j<TW;j++)for(let i=0;i<TW;i++)if(dirty[j*TW+i]){if(c>=max)return c;dirty[j*TW+i]=0;relight(i*TS,j*TS,Math.min(W,(i+1)*TS)-1,Math.min(H,(j+1)*TS)-1);c++}return c}
+// the camera: shallow depth of field toward the edges and the text column, vignette, a little grain
+function photoFinish(){
+  const base=document.createElement('canvas');base.width=W;base.height=H;base.getContext('2d').drawImage(cv,0,0);
+  const FX=470*S,FY=480*S;
+  const lay=(px,r0,r1,lx0,lx1)=>{const o=document.createElement('canvas');o.width=W;o.height=H;const c=o.getContext('2d');
+    if('filter'in c){c.filter=`blur(${px}px)`;c.drawImage(base,0,0);c.filter='none'}
+    else{const s=document.createElement('canvas'),k=Math.max(2,px*1.6);s.width=Math.ceil(W/k);s.height=Math.ceil(H/k);s.getContext('2d').drawImage(base,0,0,s.width,s.height);c.drawImage(s,0,0,W,H)}
+    const mk=document.createElement('canvas');mk.width=W;mk.height=H;const mc=mk.getContext('2d');
+    let g=mc.createRadialGradient(FX,FY,r0*S,FX,FY,r1*S);g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(1,'rgba(0,0,0,1)');mc.fillStyle=g;mc.fillRect(0,0,W,H);
+    if(lx0!==undefined){mc.globalCompositeOperation='lighter';g=mc.createLinearGradient(lx0*S,0,lx1*S,0);g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(1,'rgba(0,0,0,1)');mc.fillStyle=g;mc.fillRect(0,0,W,H)}
+    c.globalCompositeOperation='destination-in';c.drawImage(mk,0,0);ctx.drawImage(o,0,0)};
+  lay(1.3*S,380,600,826,900);lay(3*S,520,780,880,995);lay(6*S,680,980);
+  const vg=ctx.createRadialGradient(W/2,H/2,W*.38,W/2,H/2,W*.76);vg.addColorStop(0,'rgba(50,30,10,0)');vg.addColorStop(1,'rgba(50,30,10,.36)');
+  ctx.save();ctx.globalCompositeOperation='multiply';ctx.fillStyle=vg;ctx.fillRect(0,0,W,H);ctx.restore();
+  const im=ctx.getImageData(0,0,W,H),d=im.data;
+  for(let y=0,p=0;y<H;y++)for(let x=0;x<W;x++,p+=4){const n=(hash(x+3,y+11)-.5)*7;for(let c=0;c<3;c++){let v=d[p+c]/255;v=v*.84+v*v*(3-2*v)*.16;d[p+c]=v*255+n}}
+  ctx.putImageData(im,0,0)}
+
+/* =====================================================================
+   PAINTING VOCABULARY
+   ===================================================================== */
+const INK=[.085,.06,.05],SEPIA=[.34,.21,.12];
+function pen(P,o={}){stroke(P,{w:o.w??1.15,col:o.col||INK,a:o.a??.88,prof:o.prof||'pen',thick:o.thick??.22,spec:.3,dry:o.dry??.15,jit:.02,streak:.03,var:o.var??.3,wob:o.wob??.25,edge:0,load:o.load,mode:o.mode,clip:o.clip,spline:o.spline,seg:o.seg})}
+// a quick pen line as a hand draws it: restated, never twice in the same place, overshooting its ends
+function loose(P,o={}){if(P.length<2)return;const n=o.n??2,j=o.j??2,ext=o.ext??7;
+  for(let k=0;k<n;k++){const dx=k?R(-j,j):0,dy=k?R(-j,j):0;let L=P.map(p=>[p[0]+dx+R(-j,j)*.5,p[1]+dy+R(-j,j)*.5]);
+    const a=L[0],b=L[1],c=L[L.length-2],d=L[L.length-1],l0=Math.hypot(a[0]-b[0],a[1]-b[1])||1,l1=Math.hypot(d[0]-c[0],d[1]-c[1])||1,e0=R(-ext*.3,ext),e1=R(-ext*.3,ext);
+    L=[[a[0]+(a[0]-b[0])/l0*e0,a[1]+(a[1]-b[1])/l0*e0]].concat(L.slice(1,-1),[[d[0]+(d[0]-c[0])/l1*e1,d[1]+(d[1]-c[1])/l1*e1]]);
+    pen(L,{w:(o.w??1.2)*R(.7,1.3),col:o.col||INK,a:(o.a??.75)*(k?R(.4,.8):1),var:.6,wob:o.wob??.6,prof:'pen'})}}
+// a patch of quick parallel hatching
+function inkHatch(x,y,ang,n,len,gap,o={}){const nx=-Math.sin(ang),ny=Math.cos(ang);
+  for(let i=0;i<n;i++){const off=gap*i+R(-gap*.3,gap*.3),l=len*R(.6,1.15),sh=R(-len*.15,len*.15);
+    pen(arc(x+nx*off+Math.cos(ang)*sh,y+ny*off+Math.sin(ang)*sh,ang+R(-.08,.08),l,R(-.25,.25),4),{w:(o.w??.9)*R(.7,1.2),col:o.col||SEPIA,a:(o.a??.45)*R(.6,1.1),prof:'hair',var:.4})}}
+function ivyLeaf(x,y,ang,s){const poly=spline(local([[0,0],[.12,-.5],[.32,-.62],[.5,-.3],[1,0],[.5,.3],[.32,.62],[.12,.5]],x,y,ang,s),5,true);
+  gild(poly,{h:2.6,dome:1.3,dir:ang+.5,tex:.35,wear:.6});
+  q(()=>{pen(poly.concat([poly[0]]),{w:.9,a:.85,spline:false,var:.2,wob:.15,prof:'flat'});pen([[x+Math.cos(ang)*s*.1,y+Math.sin(ang)*s*.1],[x+Math.cos(ang)*s*.7,y+Math.sin(ang)*s*.7]],{w:.6,a:.5})})}
+function bezant(x,y,r){const c=[];for(let i=0;i<22;i++){const a=i/22*6.283;c.push([x+Math.cos(a)*r,y+Math.sin(a)*r])}
+  gild(c,{h:2.8,dome:Math.max(.8,r*.42),tex:.25,wear:.4});
+  q(()=>{pen(c.concat([c[0]]),{w:.85,a:.85,spline:false,prof:'flat',var:.2});for(let i=0;i<3;i++){const a=R(0,6.283);pen(arc(x+Math.cos(a)*r,y+Math.sin(a)*r,a,R(5,9),R(-.8,.8),4),{w:.7,a:.7,prof:'hair'})}})}
+function floret(x,y,r,col){q(()=>{for(let i=0;i<5;i++){const a=i/5*6.283+.3;
+    stroke(arc(x+Math.cos(a)*r*.2,y+Math.sin(a)*r*.2,a,r,0,3),{w:r*.8,prof:PROF.feather,col,col2:mix(col,[1,1,1],.5),gradN:.8,thick:.9,a:.93,spec:.1});
+    stroke(arc(x+Math.cos(a)*r*.55,y+Math.sin(a)*r*.55,a,r*.4,0,2),{w:r*.2,prof:'taper',col:[.98,.97,.95],a:.8,thick:1})}});bezant(x,y,r*.3)}
+function berry(x,y,r){q(()=>{disc(x,y,r,[.66,.13,.1],{thick:3*HS,spec:.55});disc(x-r*.3,y-r*.34,r*.22,[1,.93,.88],{a:.8});
+    pen(circleArc(x,y,r,0,6.4,18),{w:.8,a:.8,spline:false,prof:'flat'})})}
+function vine(x,y,ang,len,k0,k1,gap=40,first=30){const p=tendril(x,y,ang,len,k0,k1);q(()=>pen(p,{w:1.2,a:.85,spline:false,var:.55,wob:.55}));
+  let side=rnd()<.5?1:-1;for(let i=Math.round(first/4);i<p.length-3;i+=Math.round(R(gap*.8,gap*1.2)/4)){
+    const a=p[i],b=p[i+1],ta=Math.atan2(b[1]-a[1],b[0]-a[0]),sa=ta+side*R(.9,1.3),sl=R(11,18),e=[a[0]+Math.cos(sa)*sl,a[1]+Math.sin(sa)*sl],sd=side;
+    q(()=>pen(arc(a[0],a[1],sa,sl,sd*-.5,4),{w:.8,a:.8,prof:'flat'}));const r=rnd();
+    if(r<.6)ivyLeaf(e[0],e[1],sa,R(14,19));else if(r<.8)bezant(e[0]+Math.cos(sa)*5,e[1]+Math.sin(sa)*5,R(4.5,6.5));
+    else if(r<.92)floret(e[0]+Math.cos(sa)*8,e[1]+Math.sin(sa)*8,R(8,10),pick([[.2,.32,.66],[.78,.4,.48]]));else berry(e[0]+Math.cos(sa)*5,e[1]+Math.sin(sa)*5,R(4.5,6));
+    side=-side}
+  const e=p[p.length-1];bezant(e[0],e[1],4.6)}
+function paintLeaf(x,y,ang,len,wid,pal){const bend=R(-.5,.5),NS=22,ax=[],le=[],ri=[],wp=t=>Math.pow(Math.sin(Math.PI*Math.pow(t,.7)),1.05);
+  for(let i=0;i<=NS;i++){const t=i/NS,a=ang+bend*(t-.5),px=x+Math.cos(ang+bend*(t*.5-.25))*len*t,py=y+Math.sin(ang+bend*(t*.5-.25))*len*t,wv=wid/2*wp(t);
+    ax.push([px,py]);le.push([px-Math.sin(a)*wv,py+Math.cos(a)*wv]);ri.push([px+Math.sin(a)*wv,py-Math.cos(a)*wv])}
+  const ox=R(-2.4,2.4),oy=R(-2.4,2.4),thin=a=>a.filter((_,i)=>i%4===0||i===NS);
+  wash([le.concat(ri.slice().reverse()).map(p=>[p[0]+ox*1.8,p[1]+oy*1.8])],pal[1],{a:.4,blur:2.6,uneven:1,rim:.9,scale:14});
+  q(()=>{stroke(ax.map(p=>[p[0]+ox,p[1]+oy]),{w:wid*1.08,prof:wp,col:pal[0],col2:pal[1],grad:-1,gradN:.6,streak:.3,thick:.8,a:.9,dry:.4,spec:.1,spline:false,wob:.8});
+    stroke(ax.map((p,i)=>[(p[0]+le[i][0])/2,(p[1]+le[i][1])/2]).slice(2,NS-1),{w:wid*.36,prof:'taper',col:pal[2],a:.55,mode:'glaze',dry:0,rim:.3,gran:.3,spline:false});
+    for(let i=4;i<NS-2;i+=3)for(const sd of[le,ri]){const p=ax[i],e=sd[Math.min(NS,i+3)];pen([p,[p[0]+(e[0]-p[0])*.5,p[1]+(e[1]-p[1])*.5+.6],[p[0]+(e[0]-p[0])*.88,p[1]+(e[1]-p[1])*.88]],{w:.6,a:.45,col:mix(pal[2],INK,.4)})}
+    for(let i=5;i<NS-3;i+=2){const p=ri[i],c=ax[i+1];stroke([[p[0]*.82+c[0]*.18,p[1]*.82+c[1]*.18],[p[0]*.35+c[0]*.65,p[1]*.35+c[1]*.65]],{w:.9,prof:'comma',col:[.99,.98,.95],a:.6,thick:.7,spline:false})}
+    loose(thin(ax),{w:.9,a:.8,n:1,j:.7,ext:7});loose(thin(le),{w:.95,a:.8,n:2,j:1.1,ext:6});loose(thin(ri),{w:.95,a:.75,n:1,j:1.1,ext:6})})}
+
+/* ---------- gothic book hand for the (unreadable) text ---------- */
+const GL={
+  i:{w:.3,s:[[[-.07,-.9],[0,-1],[0,-.1],[.1,0]]]},
+  n:{w:.6,s:[[[-.07,-.9],[0,-1],[0,-.1],[.08,0]],[[0,-.8],[.15,-1],[.3,-.88],[.3,-.1],[.4,0]]]},
+  m:{w:.9,s:[[[-.07,-.9],[0,-1],[0,-.1],[.08,0]],[[0,-.8],[.15,-1],[.3,-.88],[.3,-.1],[.36,0]],[[.3,-.8],[.45,-1],[.6,-.88],[.6,-.1],[.7,0]]]},
+  u:{w:.6,s:[[[-.05,-.92],[0,-1],[0,-.16],[.12,0],[.3,-.2]],[[.3,-1],[.3,-.1],[.4,0]]]},
+  o:{w:.52,s:[[[.18,-1],[.02,-.74],[.02,-.25],[.17,0],[.33,-.26],[.33,-.76],[.18,-1]]]},
+  c:{w:.46,s:[[[.32,-.84],[.17,-1],[.02,-.72],[.02,-.25],[.16,0],[.33,-.14]]]},
+  e:{w:.48,s:[[[.32,-.84],[.17,-1],[.02,-.72],[.02,-.25],[.16,0],[.33,-.14]],[[.04,-.52],[.33,-.68],[.2,-.98]]]},
+  a:{w:.58,s:[[[.04,-.88],[.2,-1],[.32,-.85],[.32,-.1],[.42,0]],[[.32,-.56],[.1,-.5],[.01,-.24],[.12,0],[.32,-.2]]]},
+  l:{w:.3,s:[[[-.06,-1.66],[0,-1.75],[0,-.1],[.12,0]]]},
+  b:{w:.54,s:[[[-.06,-1.66],[0,-1.75],[0,-.1],[.14,0],[.33,-.24],[.33,-.74],[.18,-1],[0,-.8]]]},
+  d:{w:.54,s:[[[.18,-1],[.02,-.74],[.02,-.25],[.17,0],[.33,-.26],[.33,-.76]],[[-.14,-1.62],[.1,-1.26],[.33,-.78]]]},
+  p:{w:.54,s:[[[-.06,-.92],[0,-1],[0,.72]],[[0,-.8],[.18,-1],[.33,-.74],[.33,-.25],[.15,0],[0,-.12]]]},
+  s:{w:.3,s:[[[.3,-1.58],[.16,-1.76],[.03,-1.5],[.03,-.06],[-.05,.06]]]},
+  t:{w:.44,s:[[[.03,-1.22],[.03,-.16],[.15,0],[.31,-.13]],[[-.1,-.96],[.32,-.96]]]},
+  r:{w:.42,s:[[[-.07,-.9],[0,-1],[0,-.1],[.1,0]],[[.02,-.84],[.2,-1],[.32,-.9]]]},
+  g:{w:.56,s:[[[.18,-1],[.02,-.74],[.02,-.25],[.17,0],[.33,-.26]],[[.33,-.94],[.33,.32],[.2,.62],[0,.56],[-.05,.4]]]}
+},GK=Object.keys(GL);
+function nibStroke2D(c,pts,nw,ang){const ax=Math.cos(ang)*nw/2,ay=Math.sin(ang)*nw/2;c.lineWidth=.25;
+  for(let i=0;i<pts.length-1;i++){const a=pts[i],b=pts[i+1];c.beginPath();c.moveTo(a[0]-ax,a[1]-ay);c.lineTo(a[0]+ax,a[1]+ay);c.lineTo(b[0]+ax,b[1]+ay);c.lineTo(b[0]-ax,b[1]-ay);c.closePath();c.fill();c.stroke()}}
+function script(x0,x1){const Sx=27,LH=64,nw=3.7,rule={w:.55,col:[.62,.36,.32],a:.32,mode:'glaze',prof:'flat',flat:true,dry:0,rim:0,gran:.5,spline:false};
+  q(()=>{for(let y=44;y<1010;y+=LH)stroke([[x0-36,y+2.5],[1004,y+2.5+R(-.6,.6)]],rule);stroke([[x0-5,-5],[x0-5+R(-1,1),1005]],rule)});
+  const main=[],red=[],blue=[];
+  for(let y=44;y<1010;y+=LH){let x=x0+R(-2,4),first=true;
+    while(x<x1-10){const n=2+Math.floor(rnd()*6);
+      for(let k=0;k<n;k++){const key=pick(GK),g=GL[key];if(x+g.w*Sx>x1+8)break;
+        if(first&&rnd()<.13){(rnd()<.5?red:blue).push(['o',x-3,y+1.5,Sx*1.22,5.4]);x+=GL.o.w*Sx*1.22}
+        else{main.push([key,x,y+R(-.6,.6),Sx,nw]);x+=g.w*Sx+R(0,1.1)}first=false}
+      x+=Sx*.5}}
+  const draw=(list,col,A)=>{if(list.length)q(()=>{const m=maskDraw({x0:x0-14,y0:0,x1:1000,y1:1000},c=>{for(const[key,gx,gy,s,w]of list)for(const sp of GL[key].s)nibStroke2D(c,spline(sp.map(p=>[gx+p[0]*s+R(-.4,.4),gy+p[1]*s+R(-.4,.4)]),5),w,-.7)});if(m)inkMask(m,col,A)})};
+  draw(main,[.19,.12,.075],.93);draw(red,[.72,.2,.13],.9);draw(blue,[.2,.3,.62],.9)}
+
+/* ---------- the page itself ---------- */
+function initBand(y0,y1){for(let y=y0;y<y1;y++){const yd=y/S;for(let x=0;x<W;x++){const xd=x/S,k=y*W+x;
+    PAPER[k]=vnoise(xd/1.05+11,yd/1.05+5)*.45+vnoise(xd/2.9+3,yd/2.9+40)*.3+hash(x,y)*.25;
+    const n=fbm(xd/210,yd/210,4),n2=fbm(xd/34+50,yd/34+9,3),n3=vnoise(xd/95+7,yd/95+70),v=(n-.5)*.1+(n2-.5)*.03;
+    const vein=smooth(1-Math.abs(fbm(xd/150+31,yd/150+17,3)-.5)/.008)*.018;
+    const gr=(PAPER[k]-.5)*.035+(hash(x+5,y+9)-.5)*.012;
+    CR[k]=.93+v*.9+(n3-.5)*.014-vein*.6-gr;CG[k]=.873+v-(n3-.5)*.004-vein-gr*1.05;CB[k]=.748+v*1.3-(n3-.5)*.03-vein*1.2-gr*1.2;
+    HT[k]=0;SP[k]=.03;MT[k]=0;IR[k]=0;IH[k]=0}}
+  markDirty(0,y0,W-1,y1)}
+
+/* =====================================================================
+   THE MAGPIE — drawn in its own frame, then placed on the page
+   ===================================================================== */
+const AX=[-.57,.82],AN=[.82,.57],BK=1.2,BX=545,BY=272;
+const B=(x,y)=>[(x-880)*BK+BX,(y-420)*BK+BY],Bp=p=>B(p[0],p[1]);
+// direction the plumage lies: sweeping back from the bill, then down the body
+function flow(x,y){const hx=x-985,hy=y-412,hd=Math.hypot(hx,hy)||1,t=smooth((Math.hypot(x-880,y-420)-70)/170),w=.45+.55*t;
+  return Math.atan2(hy/hd*(1-w)+AX[1]*w,hx/hd*(1-w)+AX[0]*w)+(fbm(x/55,y/55,2)-.5)*.5}
+const bst=(P,o)=>stroke(P.map(Bp),Object.assign({},o,{w:o.w*BK,load:o.load?o.load*BK:0,wob:(o.wob||0)*BK,rag:(o.rag||0)*BK}));
+const bpen=(P,o={})=>{if(P.length>1)pen(P.map(Bp),Object.assign({},o,{w:(o.w||1)*BK,spline:P.length<12}))};
+const bloose=(P,o={})=>loose(P.map(Bp),Object.assign({},o,{w:(o.w||1.2)*BK,j:(o.j??2)*BK,ext:(o.ext??7)*BK}));
+const bhatch=(x,y,ang,n,len,gap,o={})=>{const c=B(x,y);inkHatch(c[0],c[1],ang,n,len*BK,gap*BK,Object.assign({},o,{w:(o.w||.9)*BK}))};
+const tailSort=(a,b)=>(a[0]*.57-a[1]*.82)-(b[0]*.57-b[1]*.82);
+
+// one long flight or tail feather: shaped base stroke, dry-brushed webs, hatched barbs, shaft and pen edge
+function paintFeather(a,b,o){
+  const w=o.w,bend=o.bend||0,shape=o.shape||.9,pal=o.pal,tMax=o.tMax||1,NS=30;
+  const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy),nx=-dy/L,ny=dx/L,c=[(a[0]+b[0])/2+nx*bend,(a[1]+b[1])/2+ny*bend];
+  const P=t=>[(1-t)*(1-t)*a[0]+2*t*(1-t)*c[0]+t*t*b[0],(1-t)*(1-t)*a[1]+2*t*(1-t)*c[1]+t*t*b[1]];
+  const T=t=>{const x=2*(1-t)*(c[0]-a[0])+2*t*(b[0]-c[0]),y=2*(1-t)*(c[1]-a[1])+2*t*(b[1]-c[1]),l=Math.hypot(x,y)||1;return[x/l,y/l]};
+  const wp=t=>Math.pow(Math.sin(Math.PI*Math.pow(t,shape)),.55),wid=t=>w/2*wp(t);
+  const ax=[],le=[],ri=[];for(let i=0;i<=NS;i++){const t=i/NS,p=P(t),tg=T(t),wv=wid(t);ax.push(p);le.push([p[0]-tg[1]*wv,p[1]+tg[0]*wv]);ri.push([p[0]+tg[1]*wv,p[1]-tg[0]*wv])}
+  const side=(f,t0,t1)=>{const path=[];for(let i=0;i<=NS;i++){const t=t0+(t1-t0)*i/NS,p=P(t),tg=T(t),wv=wid(t)*f;path.push([p[0]-tg[1]*wv,p[1]+tg[0]*wv])}return path};
+  q(()=>bst(ax,{w,prof:wp,col:pal.base,col2:pal.base2,grad:-1,gradN:.5,streak:.3,jit:.06,thick:.6,a:.97,dry:.12,spec:.2,spline:false}));
+  q(()=>{for(const f of(o.webs||[.62,.3,-.22,-.5,-.74])){const t0=R(.03,.12),t1=Math.min(tMax,R(.8,.95)),ex=f<0;
+      bst(side(f,t0,t1),{w:w*R(.2,.3),prof:'taper',col:ex?pal.web:pal.web2,col2:ex?pal.hi:pal.web,gradN:1,streak:.35,jit:.08,a:R(.55,.85),dry:.75,load:L*(t1-t0)*R(.6,1.1),thick:.5,spec:.22,spline:false})}});
+  const items=[];for(let i=0;i<(o.barbs||40);i++)items.push(R(.04,Math.min(.97,tMax)));
+  batch(items,10,t=>{const s=rnd()<.68?-1:1,p=P(t),tg=T(t),n=[-tg[1]*s,tg[0]*s],wv=wid(t)*R(.72,1.02),fw=wv*R(.6,1.25);
+    const e=[p[0]+n[0]*wv+tg[0]*fw,p[1]+n[1]*wv+tg[1]*fw],m=[p[0]+n[0]*wv*.6+tg[0]*fw*.22,p[1]+n[1]*wv*.6+tg[1]*fw*.22];
+    bst([p,m,e],{w:R(1.3,2.6),prof:'comma',col:s<0?mix(pal.web,pal.hi,R(.2,1)):pal.web2,a:R(.3,.7),dry:.45,thick:.4,spec:.22,jit:.1})});
+  if(o.irid)q(()=>{for(let i=0;i<3;i++){const f=R(-.8,-.15),t0=R(.08,.5)*tMax,t1=Math.min(tMax,t0+R(.2,.4)),h=o.hue+R(-25,25);
+      bst(side(f,t0,t1),{w:w*R(.14,.24),prof:'taper',col:hsv(h,R(.55,.8),R(.35,.55)),col2:hsv(h+35,.45,.75),gradN:1,streak:.4,a:R(.5,.8),dry:.85,load:L*(t1-t0)*R(.5,.9),thick:.45,irid:R(.6,1)*o.irid,hue:h,spec:.3,spline:false})}});
+  q(()=>{const sh=ax.slice(1,Math.max(3,Math.round(NS*Math.min(1,tMax+.05))));
+    bst(sh,{w:1.9,prof:'taper',col:[.015,.015,.03],a:.92,thick:.35,spec:.35,spline:false});
+    bst(sh.map(p=>[p[0]+nx*1.5,p[1]+ny*1.5]),{w:.9,prof:'taper',col:[.72,.78,.9],a:.3,thick:.2,spline:false});
+    const e0=Math.round(NS*.06),e1=Math.round(NS*Math.min(.98,tMax));
+    for(const sd of[le,ri]){const cut=Math.round(R(.4,.7)*(e1-e0))+e0;pen(sd.slice(e0,cut).map(Bp),{w:1.25,a:.6,spline:false,wob:1.1,var:.55});pen(sd.slice(cut+1,e1).map(Bp),{w:1.1,a:.5,spline:false,wob:1.1,var:.55})}})}
+
+// a field of overlapping body feathers, laid tail → head like roof tiles
+function plumage(poly,o){const pts=poisson(poly,(x,y)=>o.size(x,y)*o.spacing,o.rmin,o.rmax);pts.sort(tailSort);
+  batch(pts,4,p=>{const x=p[0],y=p[1],s=o.size(x,y)*R(.7,1.4),ang=flow(x,y)+R(-.36,.36),len=s*o.lenK,wid=s*o.widK,l=o.lit(x,y),c=o.color(x,y,l);
+    const sx=x-Math.cos(ang)*len*.45,sy=y-Math.sin(ang)*len*.45,br=Object.assign({},o.brush);if(o.loadK)br.load=len*o.loadK;
+    if(o.shadow)bst(tipArc(sx,sy,ang,len*1.07,wid*1.14,-1.25,1.25),{w:wid*.42,prof:'taper',col:o.shadow,a:o.shadowA*(1-.5*l),mode:'glaze',dry:0,rim:0,gran:.2});
+    bst(arc(sx,sy,ang,len,R(-.35,.35),6),Object.assign(br,{w:wid,prof:PROF.feather,col:c[0],col2:c[1],grad:rnd()<.5?1:-1,gradN:.6,tone2:o.tone2?o.tone2*l:0,wob:.9,var:.25}));
+    if(o.rim&&l>o.rimMin&&rnd()<o.rimP)bst(tipArc(sx,sy,ang,len*.97,wid*.9,R(-1.3,-.5),R(.5,1.3)),{w:R(1.1,2.2),prof:'taper',col:o.rim(l),a:R(.3,.65)*l,thick:.3,dry:.3,spec:.2})})}
+// broad, wet strokes of body colour laid along the lie of the feathers
+function broad(poly,n,o){const pts=sampleIn(poly,n);pts.sort(tailSort);
+  batch(pts,3,p=>{const x=p[0],y=p[1],l=o.lit(x,y),ang=flow(x,y)+R(-.42,.42),len=R(o.len[0],o.len[1]),c=o.color(x,y,l);
+    bst(arc(x-Math.cos(ang)*len*.5,y-Math.sin(ang)*len*.5,ang,len,R(-.4,.4),6),Object.assign({},o.brush,{w:R(o.w[0],o.w[1]),prof:rnd()<.5?PROF.feather:PROF.leaf,col:c[0],col2:c[1],grad:rnd()<.5?1:-1,gradN:.5,load:len*R(1,1.8),wob:1.4,var:.25,clip:o.clip?o.clip():null}))})}
+// faint curved touches that only hint at feather edges
+function hints(poly,n,o){const pts=sampleIn(poly,n);
+  batch(pts,10,p=>{const ang=flow(p[0],p[1])+R(-.2,.2),len=R(o.len[0],o.len[1]),wid=len*R(.5,.7);
+    bst(tipArc(p[0]-Math.cos(ang)*len*.5,p[1]-Math.sin(ang)*len*.5,ang,len,wid,R(-1.2,-.3),R(.3,1.2)),{w:R(o.w[0],o.w[1]),prof:'taper',col:o.col,a:R(o.a[0],o.a[1]),mode:'glaze',dry:0,rim:0,gran:.3})})}
+// fine hatching with a small pointed brush, following the lie of the feathers
+function hatch(poly,n,o){const pts=sampleIn(poly,n);pts.sort(tailSort);
+  batch(pts,14,p=>{const l=o.lit(p[0],p[1]),ang=flow(p[0],p[1])+R(-.45,.45),len=R(o.len[0],o.len[1])*(rnd()<.15?1.7:1);
+    bst(arc(p[0]-Math.cos(ang)*len*.4,p[1]-Math.sin(ang)*len*.4,ang,len,R(-.5,.5),5),{w:R(o.w[0],o.w[1])*(rnd()<.12?2.2:1),prof:'hair',col:o.color(l),a:R(o.a[0],o.a[1]),thick:o.thick??.3,dry:o.dry??.4,spec:o.spec??.2,jit:.1,wob:.5})})}
+
+function paintBird(){
+  const B1=[[962,378],[940,340],[890,316],[830,326],[785,372],[750,440],[700,520],[760,522],[800,575],[830,598],[884,621],[948,640],[960,588],[961,520],[957,462],[958,432]];
+  const B2=[[750,440],[700,520],[630,620],[560,730],[505,830],[492,870],[536,884],[580,792],[644,688],[722,576],[792,506]];
+  const B3=[[720,872],[640,885],[575,895],[545,905],[530,925],[562,934],[602,900],[650,858],[696,826],[742,832],[762,856]];
+  const belly=[[948,640],[933,668],[895,745],[845,805],[785,845],[720,870],[676,876],[666,854],[711,789],[771,709],[819,614],[836,602],[884,621]];
+  const wingPoly=[[790,500],[720,570],[640,680],[570,790],[520,880],[480,960],[540,930],[610,880],[690,790],[760,700],[815,590],[830,545]];
+  const sc=[];for(let i=0;i<24;i++){const th=i/24*6.283;sc.push([700+AX[0]*Math.cos(th)*112+AN[0]*Math.sin(th)*25,616+AX[1]*Math.cos(th)*112+AN[1]*Math.sin(th)*25])}
+  const UNDER=[[949,642],[933,668],[895,745],[845,805],[785,845],[722,871]],WINGLOW=[[819,614],[771,709],[711,789],[666,854]];
+  const BACK=[[940,340],[890,316],[830,326],[785,372],[750,440],[700,520],[630,620],[560,730],[505,830]];
+  const blackPaths=[B1,B2,B3].map(toPath),inBlack=(x,y)=>blackPaths.some(h=>hctx.isPointInPath(h,x,y));
+  // where the painted light falls (from above, slightly left)
+  const litBase=(x,y)=>{const dh=Math.hypot(x-880,y-420),lh=clamp(.5+.5*((x-880)*-.3+(y-420)*-.95)/112,0,1),v=(x-880)*AN[0]+(y-420)*AN[1],lb=clamp(.55-v/300,0,1),t=smooth((dh-95)/110);return lh*(1-t)+lb*t};
+  const litBlack=(x,y)=>clamp(litBase(x,y)*(.55+.9*fbm(x/60+3,y/60+8,3)),0,1);
+  const litWhite=(x,y)=>clamp((1-.75*smooth((y-690)/200))*(.55+.45*smooth(distPoly(x,y,WINGLOW)/34))*(.72+.28*smooth(distPoly(x,y,UNDER)/40))*(.8+.4*fbm(x/50+9,y/50+1,2)),0,1);
+  const litScap=(x,y)=>clamp(.95-.4*smooth(((x-700)*AN[0]+(y-616)*AN[1])/28)+(fbm(x/40,y/40,2)-.5)*.25,0,1);
+  const DK=[[.035,.04,.055],[.028,.034,.06],[.045,.04,.05],[.022,.028,.045],[.03,.03,.04]];
+  const blackCol=(x,y,l)=>{const c=mix(pick(DK),[.11,.14,.215],l*R(.35,.75));return[c,mix(c,[.17,.215,.32],.2+.45*l)]};
+  const WH=[[.975,.962,.925],[.96,.957,.945],[.985,.975,.955],[.955,.94,.9]];
+  const whiteCol=(x,y,l)=>{const s=rnd()<.6?[.74,.73,.80]:[.84,.77,.70],c=mix(s,pick(WH),Math.pow(l,.75));return[c,mix(c,[1,1,.985],.5)]};
+  const sizeB=(x,y)=>lerp(7.5,18,smooth((Math.hypot(x-985,y-412)-55)/300));
+
+  stage('Underdrawing');
+  q(()=>{const sk=(P,a=.3)=>bpen(P.map(p=>[p[0]+R(-3,3),p[1]+R(-3,3)]),{w:.7,a,col:SEPIA});
+    sk(BACK.slice(0,5).map(p=>[p[0]-5,p[1]-6]),.45);sk(BACK.slice(3).map(p=>[p[0]-7,p[1]-4]),.45);sk(BACK.map(p=>[p[0]-2,p[1]-10]),.22);
+    sk([[960,462],[966,520],[965,588],[953,642]],.3);sk(UNDER.slice(1,5).map(p=>[p[0]+4,p[1]+3]),.28);
+    sk(circleArc(880,420,116,-3.6,.3,9),.36);sk(circleArc(700,640,150,2.2,4.1,8),.25);sk([[958,400],[1030,392],[1096,440]],.25);sk(wingPoly.slice(4,9));sk([[760,700],[700,790],[640,860]],.25)});
+
+  /* tail — only its base is in frame */
+  stage('Tail');
+  const T0=[517,885],td=[-.527,.85],tn=[.85,.527];
+  const tailPal={base:[.022,.055,.05],base2:[.03,.11,.095],web:[.05,.27,.22],web2:[.04,.16,.15],hi:[.22,.56,.46]};
+  for(const[off,dev,len]of[[-30,-8,300],[30,8,312],[-19,-4.5,362],[19,5,372],[-8,-1.5,410],[6,1.2,428]]){
+    const a=dev*Math.PI/180,dir=[td[0]*Math.cos(a)-td[1]*Math.sin(a),td[0]*Math.sin(a)+td[1]*Math.cos(a)],b0=[T0[0]+tn[0]*off,T0[1]+tn[1]*off];
+    paintFeather(b0,[b0[0]+dir[0]*len,b0[1]+dir[1]*len],{w:58,shape:1.35,bend:R(-7,7),pal:tailPal,barbs:60,irid:.8,hue:150,tMax:.5})}
+
+  /* the perch — a vine stem springing from the gold bar */
+  stage('The perch');
+  const stem=spline([[862,676],[800,786],[680,858],[521,884],[353,893],[197,914],[53,964],[-30,1004]],12),stemW=17,sp=t=>.5+.5*smooth(t/.22);
+  const nrm=(P,d)=>P.map((p,i)=>{const a=P[Math.max(0,i-1)],b=P[Math.min(P.length-1,i+1)],dx=b[0]-a[0],dy=b[1]-a[1],l=Math.hypot(dx,dy)||1,t=i/(P.length-1),k=d*sp(t);return[p[0]-dy/l*k,p[1]+dx/l*k]});
+  wash([nrm(stem,13).concat(nrm(stem,-17).reverse())],[.8,.66,.46],{a:.34,blur:3,uneven:1,rim:.8,scale:22});
+  q(()=>{stroke(nrm(stem,-6),{w:10,prof:'flat',flat:true,col:[.62,.5,.4],a:.3,mode:'glaze',dry:0,rim:0,gran:.2,spline:false});
+    stroke(stem,{w:stemW,prof:sp,col:[.3,.2,.1],col2:[.56,.41,.22],grad:1,gradN:.45,streak:.3,thick:.9,a:.96,dry:.15,spec:.12,spline:false});
+    for(let i=0;i<9;i++){const t0=R(0,.8),seg=stem.slice(Math.floor(t0*stem.length),Math.floor((t0+R(.08,.2))*stem.length));if(seg.length>3)stroke(nrm(seg,R(-5,6)),{w:R(1,2.4),prof:'taper',col:rnd()<.5?[.2,.13,.07]:[.72,.58,.36],a:R(.35,.6),dry:.6,thick:.4,spline:false})}
+    pen(nrm(stem,stemW/2),{w:1.25,a:.85,spline:false,var:.5,wob:1.3});pen(nrm(stem,-stemW/2),{w:1.05,a:.8,spline:false,var:.5,wob:1.3});
+    loose(nrm(stem,stemW/2+1.5).filter((_,i)=>i%11===0).slice(1,7),{w:.9,a:.45,n:1,j:1.6,ext:12});loose(nrm(stem,-stemW/2-1.5).filter((_,i)=>i%11===0).slice(3,9),{w:.9,a:.4,n:1,j:1.6,ext:12});
+    inkHatch(596,893,2.3,6,11,3.6,{a:.4});inkHatch(318,903,2.3,5,10,3.6,{a:.35});inkHatch(742,838,2.6,5,10,3.4,{a:.35})});
+  const GRN=[[.36,.5,.29],[.56,.67,.4],[.2,.3,.17]],ROSE=[[.78,.47,.5],[.92,.7,.68],[.5,.24,.3]],BLU=[[.3,.42,.7],[.56,.67,.87],[.15,.22,.45]];
+  paintLeaf(793,797,-2.25,78,31,GRN);paintLeaf(700,850,1.15,66,27,ROSE);paintLeaf(604,872,-1.85,60,25,GRN);paintLeaf(300,900,1.9,70,29,BLU);paintLeaf(822,748,-.5,34,15,ROSE);
+
+  /* thin first washes, as a miniaturist blocks in */
+  stage('First washes');
+  wash([B1,B2].map(p=>spline(p.map(v=>[v[0]+(v[0]-800)*.03+R(-5,5),v[1]+(v[1]-520)*.03+R(-5,5)]),5,true).map(Bp)),[.5,.56,.7],{a:.3,blur:5,uneven:1,rim:.9,scale:30});
+  wash([B1,B2,B3].map(p=>spline(p,5,true).map(Bp)),[.2,.24,.36],{a:.9,blur:2.2,uneven:.5,rim:.5});
+  wash([spline(wingPoly,5,true).map(Bp)],[.17,.22,.42],{a:.85,blur:2,uneven:.5});
+  wash([spline(belly,5,true).map(Bp),sc.map(Bp)],[.985,.97,.94],{a:.46,blur:3,mode:'body',uneven:.8,thick:.3});
+
+  wash([spline(UNDER.map(p=>[p[0]+9,p[1]+7]).concat(UNDER.slice().reverse().map(p=>[p[0]-6,p[1]-4])),5,true).map(Bp)],[.74,.68,.66],{a:.34,blur:5,uneven:1,rim:.8,scale:26});
+  wash([blob(...B(560,800),46,9,.45)],[.55,.62,.8],{a:.3,blur:6,uneven:1,rim:.9,scale:24});
+  /* white breast and belly — thick body colour */
+  stage('White plumage');
+  let bellyClip=null,scClip=null;
+  q(()=>{bellyClip=polyMask([spline(belly,5,true).map(Bp)],16);blurMask(bellyClip,2.2*S);scClip=polyMask([sc.map(Bp)],34);blurMask(scClip,3.6*S)});
+  const brW={a:.9,dry:.35,thick:.85,spec:.08,streak:.05,jit:.015,vary:.05,clump:3.5,pick:.012};
+  broad(belly,100,{lit:litWhite,color:whiteCol,len:[55,110],w:[22,40],brush:brW,clip:()=>bellyClip});
+  wash([spline([[933,668],[895,745],[845,805],[785,845],[720,870],[704,842],[772,806],[840,758],[890,694]],5,true).map(Bp)],[.6,.59,.72],{a:.26,blur:8,rim:0,uneven:.4});
+  wash([spline([[819,614],[771,709],[711,789],[666,854],[690,850],[736,790],[792,716],[838,628]],5,true).map(Bp)],[.55,.56,.7],{a:.3,blur:6,rim:0,uneven:.4});
+  wash([blob(...B(900,690),44,9,.3)],[.97,.86,.8],{a:.3,blur:14,rim:0,uneven:.5});
+  broad(belly,34,{lit:(x,y)=>Math.min(1,litWhite(x,y)+.25),color:whiteCol,len:[40,80],w:[14,26],brush:Object.assign({},brW,{a:.75,dry:.6}),clip:()=>bellyClip});
+  hints(belly,46,{len:[24,40],w:[1,1.9],a:[.14,.34],col:[.55,.54,.66]});
+  q(()=>{const edge=spline(UNDER.concat([[676,876]]),6);for(let i=0;i<26;i++){const p=pick(edge),ang=flow(p[0],p[1])+R(-.6,.5),len=R(26,52),l=litWhite(p[0],p[1]),c=whiteCol(p[0],p[1],Math.min(1,l+.2));
+      bst(arc(p[0]-Math.cos(ang)*len*.6+R(-6,3),p[1]-Math.sin(ang)*len*.6+R(-6,3),ang,len,R(-.5,.5),5),{w:R(6,13),prof:PROF.leaf,col:c[0],col2:c[1],gradN:.5,a:R(.6,.9),dry:.65,load:len,thick:.8,spec:.08,streak:.06,wob:1})}});
+  hatch(belly,90,{lit:litWhite,len:[16,38],w:[1.1,2.2],a:[.35,.7],thick:.6,spec:.08,color:l=>l>.45?pick(WH):mix([.66,.64,.74],pick(WH),l)});
+
+  /* legs and feet */
+  stage('Legs');
+  q(()=>{for(const[a,b,far]of[[[728,858],[742,930],1],[[772,848],[791,925],0]]){const base=far?[.05,.05,.06]:[.075,.075,.085],hi=[.21,.21,.24];
+    bst([a,[(a[0]+b[0])/2+3,(a[1]+b[1])/2],b],{w:far?8:10,prof:t=>.82+.18*Math.sin(Math.PI*t),col:base,col2:hi,grad:1,gradN:.3,thick:.8,a:.97,spec:.3,streak:.2});
+    for(let i=1;i<7;i++){const t=i/7.5,px=a[0]+(b[0]-a[0])*t+3*Math.sin(Math.PI*t)*.5,py=a[1]+(b[1]-a[1])*t;bst([[px-4,py-.4],[px+4,py+1]],{w:.9,prof:'taper',col:[.3,.3,.34],a:.45,thick:.3,spline:false})}
+    for(const[dx1,dy1,dx2,dy2]of[[32,3,43,15],[21,7,28,18],[10,9,13,19],[-20,6,-26,15]]){
+      bst([b,[b[0]+dx1,b[1]+dy1],[b[0]+dx2,b[1]+dy2]],{w:far?5.2:6.4,prof:t=>1-.45*t,col:base,col2:hi,grad:dx2>0?-1:1,gradN:.3,thick:.8,a:.97,spec:.3});
+      bst([[b[0]+dx1*.55-1.5,b[1]+dy1*.55-2.2],[b[0]+dx1*.55+1.5,b[1]+dy1*.55+2.6]],{w:.8,prof:'taper',col:[.32,.32,.36],a:.45,thick:.3,spline:false});
+      bst(arc(b[0]+dx2,b[1]+dy2,dx2>0?1.9:1.2,10,dx2>0?.9:-.9,4),{w:2.6,prof:'hair',col:[.02,.02,.025],a:.97,thick:.6,spec:.5})}}});
+
+  /* folded wing: seven flight feathers, then three rows of coverts */
+  stage('Wing');
+  const A=[790,590],wa=[-.64,.77],wn=[.77,.64];
+  for(let i=0;i<7;i++){const s=42-i*14,L=483-i*36,b0=[A[0]+wn[0]*s+wa[0]*40,A[1]+wn[1]*s+wa[1]*40],tip=[A[0]+wa[0]*L+wn[0]*s*.3,A[1]+wa[1]*L+wn[1]*s*.3];
+    const pal=i<2?{base:[.025,.03,.07],base2:[.04,.06,.14],web:[.07,.11,.28],web2:[.035,.05,.12],hi:[.24,.34,.6]}
+      :i<5?{base:[.035,.06,.2],base2:[.06,.12,.36],web:[.1,.22,.6],web2:[.05,.09,.27],hi:[.5,.64,.92]}
+      :{base:[.03,.075,.17],base2:[.05,.16,.3],web:[.08,.3,.46],web2:[.04,.1,.2],hi:[.44,.74,.8]};
+    paintFeather(b0,tip,{w:38,shape:.9,bend:R(2,9),pal,barbs:54,irid:i<2?.35:.75,hue:i<5?228:188})}
+  const covPts=[];for(let r=2;r>=0;r--)for(let j=0;j<5;j++)covPts.push([A[0]+wn[0]*(42-j*21)+wa[0]*(-14+r*40)+R(-4,4),A[1]+wn[1]*(42-j*21)+wa[1]*(-14+r*40)+R(-4,4),r]);
+  batch(covPts,3,c=>{const ang=Math.atan2(wa[1],wa[0])+R(-.12,.12),sx=c[0]-wa[0]*12,sy=c[1]-wa[1]*12,len=68,wid=38,l=litBlack(c[0],c[1]);
+    bst(tipArc(sx,sy,ang,len*1.06,wid*1.12,-1.2,1.2),{w:8,prof:'taper',col:[.01,.012,.03],a:.6,thick:.3});
+    bst(arc(sx,sy,ang,len,R(-.2,.2),6),{w:wid,prof:PROF.feather,col:[.03,.045,.1],col2:[.06,.12,.24],grad:-1,gradN:.6,streak:.3,jit:.08,thick:.65,a:.96,dry:.15,spec:.22,tone2:.3});
+    bst(tipArc(sx,sy,ang,len*.97,wid*.9,R(-1.2,-.6),R(.5,1.2)),{w:R(1.4,2.4),prof:'taper',col:mix([.14,.3,.42],[.3,.56,.68],l),a:R(.4,.7),thick:.35,dry:.3,spec:.25})});
+
+  /* black plumage: block in dark, then model each feather */
+  stage('Black plumage');
+  const brA={a:.96,dry:.12,thick:.55,spec:.15,streak:.3,jit:.1,clump:3},brB={a:.9,dry:.42,thick:.6,spec:.16,streak:.35,jit:.12,clump:2.6};
+  for(const reg of[B3,B2,B1])plumage(reg,{size:(x,y)=>sizeB(x,y)*1.15,spacing:.62,rmin:5,rmax:13.5,lenK:2.8,widK:1.15,lit:(x,y)=>litBlack(x,y)*.5,color:blackCol,brush:brA});
+  for(const reg of[B3,B2,B1])plumage(reg,{size:sizeB,spacing:.56,rmin:4,rmax:10.5,lenK:2.9,widK:1,lit:litBlack,color:blackCol,tone2:.6,loadK:1.4,brush:brB,
+    rim:l=>mix([.14,.18,.27],[.26,.33,.46],l),rimMin:.45,rimP:.3});
+  for(const[reg,n]of[[B3,180],[B2,520],[B1,1400]])hatch(reg,n,{lit:litBlack,len:[10,30],w:[1,2.1],a:[.25,.6],thick:.3,spec:.16,color:l=>rnd()<.45+.4*l?mix([.1,.13,.2],[.26,.33,.46],l*R(.4,1)):pick(DK)});
+
+  for(const[reg,n]of[[B3,10],[B2,26],[B1,46]]){const pts=sampleIn(reg,n);pts.sort(tailSort);batch(pts,3,p=>{const l=litBlack(p[0],p[1]),ang=flow(p[0],p[1])+R(-.45,.45),len=R(34,80);
+    bst(arc(p[0]-Math.cos(ang)*len*.45,p[1]-Math.sin(ang)*len*.45,ang,len,R(-.6,.6),6),{w:R(4,10),prof:rnd()<.5?'comma':'leaf',col:rnd()<.5+.3*l?mix([.07,.09,.14],[.2,.26,.38],l*R(.5,1)):pick(DK),col2:[.02,.025,.04],gradN:.9,streak:.45,
+      a:R(.45,.8),dry:.7,load:len*R(.7,1.2),thick:.7,spec:.16,wob:1.2,var:.3})})}
+
+  /* white scapulars lying over the wing */
+  stage('Scapulars');
+  broad(sc,50,{lit:litScap,color:whiteCol,len:[50,95],w:[18,30],brush:Object.assign({},brW,{pick:0,a:.96,dry:.2}),clip:()=>scClip});
+  broad(sc,22,{lit:(x,y)=>Math.min(1,litScap(x,y)+.15),color:whiteCol,len:[40,80],w:[14,24],brush:Object.assign({},brW,{pick:.003,a:.8,dry:.55}),clip:()=>scClip});
+  q(()=>{for(let i=0;i<16;i++){const th=R(-1,1),k=R(.7,1),x=700+AX[0]*Math.cos(th)*112*k+AN[0]*Math.sin(th)*25*k,y=616+AX[1]*Math.cos(th)*112*k+AN[1]*Math.sin(th)*25*k,ang=Math.atan2(AX[1],AX[0])+R(-.18,.18)+th*.12,len=R(38,70),l=litScap(x,y),c=whiteCol(x,y,l);
+      bst(arc(x-Math.cos(ang)*len*.55,y-Math.sin(ang)*len*.55,ang,len,R(-.25,.25),6),{w:R(9,16),prof:PROF.leaf,col:c[0],col2:c[1],gradN:.5,a:.94,dry:.25,thick:.85,spec:.08,streak:.05,jit:.015})}
+    for(let i=0;i<70;i++){const th=R(0,6.283),x=700+AX[0]*Math.cos(th)*112+AN[0]*Math.sin(th)*25,y=616+AX[1]*Math.cos(th)*112+AN[1]*Math.sin(th)*25,ang=flow(x,y)+R(-.35,.35),len=R(12,30);
+      bst(arc(x-Math.cos(ang)*len*.5+R(-3,3),y-Math.sin(ang)*len*.5+R(-3,3),ang,len,R(-.4,.4),4),{w:R(1.1,2.4),prof:'hair',col:rnd()<.62?pick(WH):pick(DK),a:.88,thick:.5,spec:.1})}});
+  hints(sc,16,{len:[22,36],w:[1,1.8],a:[.14,.32],col:[.55,.54,.66]});
+  hatch(sc,40,{lit:litScap,len:[16,36],w:[1.1,2.2],a:[.35,.7],thick:.6,spec:.08,color:l=>l>.45?pick(WH):mix([.66,.64,.74],pick(WH),l)});
+
+  /* iridescence: broken touches of metallic colour along the feather tracts */
+  stage('Iridescent colour');
+  const HUES=[[860,345,255],[930,372,236],[880,455,172],[925,520,228],[790,400,214],[735,480,196],[905,585,262],[600,690,165],[530,810,150],[640,872,276],[776,640,205]];
+  const hueAt=(x,y)=>{let sx=0,sy=0;for(const[hx,hy,h]of HUES){const d2=(x-hx)*(x-hx)+(y-hy)*(y-hy)+400,w=1/(d2*d2),an=h*Math.PI/180;sx+=w*Math.cos(an);sy+=w*Math.sin(an)}
+    return Math.atan2(sy,sx)*180/Math.PI+(fbm(x/30,y/30,2)-.5)*50+R(-10,10)};
+  const bump=(x,y,cx,cy,r)=>Math.exp(-((x-cx)*(x-cx)+(y-cy)*(y-cy))/(r*r));
+  const sheenAt=(x,y)=>clamp((smooth((litBase(x,y)-.52)/.36)*.9+.7*bump(x,y,876,462,50)+.4*bump(x,y,905,580,42)+.35*bump(x,y,640,872,40)+.55*bump(x,y,776,640,46))*(.5+.75*fbm(x/16+7,y/16+3,3)),0,1);
+  const COV=[[772,556],[834,598],[806,694],[722,652]],cand=[],scPath=toPath(sc);
+  for(const[reg,n]of[[B1,5600],[B2,2200],[B3,650],[COV,700]])for(const p of sampleIn(reg,n)){if(hctx.isPointInPath(scPath,p[0],p[1]))continue;const sv=sheenAt(p[0],p[1]);if(rnd()<sv*.62)cand.push([p[0],p[1],sv])}
+  cand.sort(tailSort);
+  batch(cand.filter(()=>rnd()<.2),8,it=>{const x=it[0],y=it[1],f=it[2],h=hueAt(x,y),ang=flow(x,y)+R(-.25,.25),len=R(18,42);
+    bst(arc(x-Math.cos(ang)*len*.4,y-Math.sin(ang)*len*.4,ang,len,R(-.4,.4),5),{w:R(7,15),prof:PROF.feather,col:hsv(h,R(.6,.85),R(.15,.28)),col2:hsv(h+R(15,40),.7,R(.3,.44)),gradN:1,streak:.4,jit:.1,
+      a:R(.3,.52)*(.35+.65*f),dry:.6,load:len*1.4,thick:.4,irid:.4,hue:h,spec:.22,tone2:.6})});
+  batch(cand,16,it=>{const x=it[0],y=it[1],f=it[2],h=hueAt(x,y),ang=flow(x,y)+R(-.3,.3),len=R(12,38);
+    bst(arc(x-Math.cos(ang)*len*.4,y-Math.sin(ang)*len*.4,ang,len,R(-.5,.5),5),{w:R(1.2,2.9),prof:'hair',col:hsv(h,R(.5,.75),R(.4,.74)),a:R(.3,.8)*(.3+.7*f),dry:.5,thick:.35,irid:.3+.7*f,hue:h,spec:.3,jit:.12})});
+
+  /* stray hairs that break the silhouette */
+  stage('Feather edges');
+  q(()=>{const back=spline(BACK,10);for(let i=1;i<back.length-1;i++){const p=back[i];for(let k=0;k<2;k++){const ang=flow(p[0],p[1])+R(.05,.55),len=R(8,26);
+        bst(arc(p[0]+R(-3,3),p[1]+R(-3,3),ang,len,R(-.4,.4),4),{w:R(1,2.2),prof:'hair',col:pick(DK),a:.9,thick:.3,spec:.15})}}
+    const front=spline([[957,462],[961,520],[960,588],[948,640]],14);for(let i=1;i<front.length;i++){const p=front[i],ang=flow(p[0],p[1])-R(.1,.6),len=R(8,22);
+        bst(arc(p[0]+R(-3,2),p[1]+R(-3,3),ang,len,R(-.4,.4),4),{w:R(1,2),prof:'hair',col:pick(DK),a:.9,thick:.3,spec:.15})}
+    const bib=spline([[800,575],[830,598],[884,621],[948,640]],14);for(let i=0;i<bib.length;i++){const p=bib[i];for(let k=0;k<2;k++){const ang=flow(p[0],p[1])+R(-.35,.35),len=R(12,30);
+        bst(arc(p[0]+R(-4,4),p[1]+R(-6,2),ang,len,R(-.4,.4),4),{w:R(1.1,2.4),prof:'hair',col:pick(DK),a:.9,thick:.3,spec:.15})}}
+    const und=spline(UNDER,12);for(let i=2;i<und.length-9;i++){const p=und[i],ang=flow(p[0],p[1])+R(-.5,.15),len=R(8,22);
+        bst(arc(p[0]+R(-7,1),p[1]+R(-7,1),ang,len,R(-.5,.5),4),{w:R(.9,1.8),prof:'hair',col:rnd()<.6?pick(WH):[.5,.44,.42],a:.8,thick:.6})}});
+
+  paintNib();
+
+  /* bill */
+  stage('Bill and eye');
+  const up=spline([[958,380],[1000,377],[1046,395],[1079,424],[1091,443],[1070,437],[1020,432],[958,431]],7,true),lo=spline([[958,437],[1020,439],[1066,445],[1075,453],[1040,463],[1000,467],[955,463]],7,true);
+  q(()=>{const cu=polyMask([up.map(Bp)],4),cl=polyMask([lo.map(Bp)],4);
+    bst([[957,434.5],[1010,436],[1057,439.5]],{w:9,prof:'flat',col:[.02,.015,.02],a:.96,thick:.2});
+    fillMask(cl,[.045,.045,.056],{a:.92,thick:.5,spec:.12,uneven:.4});fillMask(cu,[.06,.062,.078],{a:.92,thick:.55,spec:.13,uneven:.4});
+    bst([[960,451],[1005,453],[1050,452],[1072,449]],{w:26,prof:t=>1-.4*t,col:[.04,.04,.05],col2:[.12,.125,.15],grad:-1,gradN:.7,streak:.5,thick:.8,a:.9,dry:.45,spec:.12,wob:.8,clip:cl});
+    bst([[966,442.5],[1010,444],[1056,447.5]],{w:2.2,prof:'taper',col:[.3,.33,.4],a:.5,dry:.5,thick:.4,clip:cl});
+    bst([[960,406],[1005,404],[1048,414],[1082,435]],{w:32,prof:t=>1-.5*t,col:[.05,.052,.066],col2:[.17,.18,.23],grad:-1,gradN:.7,streak:.5,thick:.85,a:.9,dry:.45,spec:.13,wob:.8,clip:cu});
+    bst([[962,396],[1002,393],[1040,404],[1068,422]],{w:11,prof:'leaf',col:[.1,.11,.14],col2:[.22,.24,.3],gradN:.9,streak:.5,a:.6,dry:.75,load:90,thick:.7,spec:.14,wob:1});
+    bst([[962,428],[1015,429],[1066,435]],{w:6,prof:'taper',col:[.015,.015,.025],a:.7,thick:.3,clip:cu});
+    bst([[968,387],[1004,385],[1042,398],[1070,419],[1085,437]],{w:5.5,prof:'taper',col:[.4,.44,.53],col2:[.62,.67,.77],gradN:1,a:.72,dry:.75,load:80,thick:.8,spec:.25,wob:.8,clip:cu});
+    bst([[996,386.5],[1016,389],[1034,395.5]],{w:2.3,prof:'comma',col:[.87,.9,.96],a:.8,dry:.5,thick:1.4,spec:.3,clip:cu});
+    bst([[981,397],[994,399.5]],{w:5,prof:'taper',col:[.01,.01,.015],a:.85,thick:.2,spline:false});
+    bpen([[957,434],[1012,435.5],[1068,440.5]],{w:1.5,a:.95,col:[.02,.015,.015]});
+    bpen(up.concat([up[0]]),{w:.9,a:.45,var:.5});bpen(lo.concat([lo[0]]),{w:.9,a:.42,var:.5});
+    bloose([[955,381],[1000,376.5],[1046,394.5],[1080,424],[1092.5,445]],{w:1.3,a:.85,n:2,j:1.5,ext:9});bloose([[954,464],[1000,468],[1040,464],[1077,453]],{w:1.2,a:.8,n:2,j:1.4,ext:8});
+    for(let i=0;i<46;i++){const y=R(378,420),x=R(948,972);bst(arc(x,y,R(-.35,.4)+(y-398)/60,R(18,36),R(-.3,.3),4),{w:R(1.2,2.4),prof:'hair',col:pick(DK),a:.92,thick:.35,spec:.22})}
+    for(let i=0;i<16;i++){const y=R(440,468),x=R(946,962);bst(arc(x,y,R(.2,.9),R(12,22),R(-.3,.3),4),{w:R(1.1,2),prof:'hair',col:pick(DK),a:.9,thick:.3,spec:.15})}});
+
+  /* eye */
+  q(()=>{const[ex,ey]=B(926,404);
+    disc(ex,ey,17.5,[.02,.022,.03],{soft:.22,thick:.4,spec:.25});
+    stroke(circleArc(ex,ey,14.8,-2.7,.5),{w:1.5,col:[.33,.37,.46],a:.7,prof:'taper',thick:.4,spline:false});
+    stroke(circleArc(ex,ey,14.8,.9,2.9),{w:1.2,col:[.24,.27,.34],a:.55,prof:'taper',thick:.4,spline:false});
+    disc(ex,ey,12.4,[.065,.042,.03],{thick:2.2*HS,base:.5,spec:.4,soft:.2});
+    stroke(circleArc(ex+.4,ey+.5,8.8,.2,1.9),{w:2.6,col:[.36,.24,.14],a:.6,prof:'taper',thick:.2,spline:false});
+    disc(ex,ey,6.6,[.008,.008,.012],{});
+    stroke([[ex-6.4,ey-3.6],[ex-4,ey-5.8],[ex-1.4,ey-5.2]],{w:3,prof:'comma',col:[1,1,.98],a:.95,thick:1.3,spec:.3,dry:.2});disc(ex+4.6,ey+4.8,1.2,[.8,.85,.95],{a:.45,soft:.5});
+    loose(circleArc(ex,ey,16.6,-3.4,1,6),{w:.9,a:.5,n:1,j:.8,ext:4,col:[.3,.33,.41]})});
+
+  /* last pen work and highlights */
+  stage('Pen work');
+  q(()=>{const und=spline(UNDER,9);bpen(und.slice(0,24),{w:1.15,col:SEPIA,a:.7});bpen(und.slice(1,22).map(p=>[p[0]+R(-1.5,1.5),p[1]+R(-1.5,1.5)]),{w:.8,col:SEPIA,a:.4});bpen(und.slice(20,37),{w:1.05,col:SEPIA,a:.65});
+    bpen(sc.slice(1,12),{w:.8,col:[.45,.44,.5],a:.4});
+    for(let i=0;i<14;i++){const x=R(700,880),y=R(700,850);if(distPoly(x,y,UNDER)<46)bpen(arc(x,y,flow(x,y)+R(-.2,.2),R(10,22),R(-.3,.3),4),{w:.7,col:SEPIA,a:.3})}
+    // the pen goes round again, never quite where the brush went
+    bloose([[938,335],[890,310],[829,320],[782,367]],{w:1.6,a:.85,n:3,j:3.2,ext:16});
+    bloose([[790,361],[747,435],[696,516],[627,615]],{w:1.5,a:.8,n:3,j:3.6,ext:18});
+    bloose([[634,611],[557,726],[500,828]],{w:1.5,a:.75,n:2,j:3.6,ext:18});
+    bloose([[961,466],[967,520],[965,588],[952,640]],{w:1.5,a:.85,n:3,j:2.6,ext:14});
+    bloose([[951,644],[935,670],[897,747],[847,807],[792,845]],{w:1.5,a:.85,n:3,j:2.6,ext:16,col:mix(SEPIA,INK,.6)});
+    bloose([[821,616],[773,710],[713,790],[669,852]],{w:1,a:.5,n:2,j:2.4,ext:10});
+    bloose([sc[2],sc[4],sc[6],sc[8],sc[10]],{w:.95,a:.45,n:2,j:2,ext:9,col:[.3,.28,.3]});
+    bhatch(866,772,2.25,8,26,4.4,{a:.62,w:1.1});bhatch(800,822,2.3,7,22,4.2,{a:.6,w:1.1});bhatch(742,752,2.2,6,22,4,{a:.55,w:1.1,col:[.3,.3,.4]});bhatch(905,690,2.2,5,16,4.2,{a:.4})})}
+
+// the pen nib, gilt on a raised cushion, with slit, breather hole and an inky tip
+function paintNib(){stage('The nib');
+  const N0=B(1065,440),N1=B(1095,614),nl=Math.hypot(N1[0]-N0[0],N1[1]-N0[1]),nu=[(N1[0]-N0[0])/nl,(N1[1]-N0[1])/nl],nv=[-nu[1],nu[0]];
+  const pr=[[0,9],[.03,11.5],[.3,12.5],[.46,14],[.54,21],[.62,21.5],[.72,15],[.85,7.5],[.95,2.6],[1,.4]].map(p=>[p[0],p[1]*BK]);
+  const hw=u=>{for(let i=0;i<pr.length-1;i++)if(u<=pr[i+1][0]){const k=(u-pr[i][0])/(pr[i+1][0]-pr[i][0]);return pr[i][1]+(pr[i+1][1]-pr[i][1])*smooth(k)}return .4};
+  const NP=(u,v)=>[N0[0]+nu[0]*u*nl+nv[0]*v,N0[1]+nu[1]*u*nl+nv[1]*v];
+  const nL=[],nR=[];for(let i=0;i<=40;i++){const u=i/40;nL.push(NP(u,-hw(u)));nR.push(NP(u,hw(u)))}
+  const poly=nL.concat(nR.slice().reverse());
+  q(()=>{const m=polyMask([poly],6);if(!m)return;const sx=rnd()*99;
+    for(let j=0;j<m.h;j++)for(let i=0;i<m.w;i++){const a=m.a[j*m.w+i];if(a<.01)continue;const x=m.x0+i,y=m.y0+j,k=y*W+x,xd=(x+.5)/S,yd=(y+.5)/S;
+      const dx=xd-N0[0],dy=yd-N0[1],u=(dx*nu[0]+dy*nu[1])/nl,vv=dx*nv[0]+dy*nv[1],v=clamp(vv/(hw(clamp(u,0,1))+.01),-1,1);
+      let h=9*HS*Math.pow(1-v*v,.75)+2*HS;
+      if(u>.6)h-=3.2*HS*Math.exp(-(vv*vv)/.3);
+      const hd=Math.hypot((u-.585)*nl,vv);h-=5*HS*smooth(1-hd/4.2);
+      for(const uu of[.2,.235])if(Math.abs(v)<.82)h-=1.6*HS*Math.exp(-Math.pow((u-uu)*nl/.7,2));
+      h+=(vnoise(u*nl/9+sx,vv/.5)-.5)*.5+(vnoise(u*nl/2.5,vv/.28+7)-.5)*.25;
+      const stain=smooth((u-.74+(fbm(xd/5,yd/5,2)-.5)*.12)/.2),dk=Math.max(stain*.92,smooth(1-hd/3.4)),tone=.95+.15*fbm(xd/18+sx,yd/18,2);
+      const r=lerp(.64*tone,.05,dk),g=lerp(.47*tone,.04,dk),b=lerp(.16*tone,.04,dk);
+      CR[k]+=(r-CR[k])*a;CG[k]+=(g-CG[k])*a;CB[k]+=(b-CB[k])*a;HT[k]=HT[k]*(1-a)+a*h;MT[k]+=((1-dk)-MT[k])*a;SP[k]+=(.6-SP[k])*a;IR[k]*=1-a}
+    markDirty(m.x0,m.y0,m.x0+m.w,m.y0+m.h)});
+  q(()=>{pen(poly.concat([poly[0]]),{w:1.15,a:.9,spline:false,prof:'flat',var:.3,wob:.2});
+    pen([NP(.61,0),NP(.8,.25),NP(1,0)],{w:1,a:.9});
+    loose(nR.filter((_,i)=>i%7===0),{w:1,a:.5,n:1,j:1.2,ext:6});
+    for(let i=0;i<16;i++){const r=Math.pow(rnd(),1.7)*52,an=R(.35,2.7),t=NP(1.06,0);disc(t[0]+Math.cos(an)*r*.8,t[1]+Math.sin(an)*r+7,R(.35,1.5)*(1-r/80),[.05,.04,.04],{a:R(.55,.95),soft:.4})}
+    const d=NP(1.045,0);pen([NP(.985,0),NP(1.03,0)],{w:2.4,a:.95,prof:'flat',spline:false});disc(d[0],d[1],4.6,[.03,.025,.03],{thick:5*HS,base:.3,spec:.9,soft:.25})})}
+
+/* =====================================================================
+   THE PAINTING
+   ===================================================================== */
+function compose(){
+  stage('Preparing the vellum');
+  const NB=24;for(let b=0;b<NB;b++)q(()=>initBand(Math.floor(b*H/NB),Math.floor((b+1)*H/NB)));
+  for(let i=0;i<7;i++)wash([blob(R(0,1000),R(0,1000),R(60,190),9,.4)],[.87,.75,.57],{a:.06,blur:22,uneven:.6,rim:0,gran:.2});
+  q(()=>{for(let i=0;i<2600;i++)disc(R(0,1000),R(0,1000),R(.25,.9),[.58,.43,.28],{a:R(.05,.26),mode:'glaze',soft:.5});
+    for(let c=0;c<26;c++){const cx=R(0,1000),cy=R(0,1000),an=R(0,3.14);for(let i=0;i<34;i++){const d=R(-60,60),o=R(-9,9);disc(cx+Math.cos(an)*d-Math.sin(an)*o,cy+Math.sin(an)*d+Math.cos(an)*o,R(.3,.8),[.55,.4,.26],{a:R(.06,.22),mode:'glaze',soft:.5})}}
+    for(let i=0;i<60;i++){const x=R(0,1000),y=R(0,1000),an=R(-.5,-.15),l=R(40,200);stroke([[x,y],[x+Math.cos(an)*l,y+Math.sin(an)*l]],{w:R(.5,1.1),col:[.8,.7,.55],a:R(.05,.12),mode:'glaze',prof:'taper',dry:0,rim:0,gran:0,spline:false})}});
+
+  stage('Ruling and script');
+  script(884,1012);
+
+  stage('Laying gold leaf');
+  gild(rect(852,-30,870,1030),{h:3.4,dome:2.2,dir:1.5,tex:.45});
+  q(()=>{stroke([[846.6,-20],[846.4,1020]],{w:8,col:[.15,.22,.5],col2:[.24,.34,.66],gradN:1,flat:true,prof:'flat',streak:.3,thick:.6,a:.95,dry:.2,spec:.15,spline:false,wob:.3});
+    for(let y=6;y<1000;y+=10.5)disc(846.5+R(-.4,.4),y+R(-.5,.5),R(1,1.45),[.97,.96,.93],{thick:1.6,spec:.15});
+    for(const x of[842.4,851.2,870.8])pen([[x,-10],[x+R(-.3,.3),500],[x+R(-.3,.3),1010]],{w:.95,a:.8,var:.25})});
+  vine(-8,250,.25,560,-.0012,-.034);
+  vine(790,-8,1.6,300,.004,.05);
+  vine(676,859,1.1,170,.008,.08,34,24);
+  vine(-8,640,-.9,200,.006,.07,36,26);
+
+  paintBird();
+}
+function testScene(){
+  for(let b=0;b<8;b++)q(()=>initBand(Math.floor(b*H/8),Math.floor((b+1)*H/8)));
+  wash([blob(700,420,70,9,.3)],[.2,.24,.36],{a:.9,blur:2.2});
+  gild(rect(520,120,560,520),{h:3.4,dome:2.2,dir:1.5,tex:.45});
+  ivyLeaf(620,200,.3,24);bezant(650,300,8);berry(640,340,6);floret(690,250,10,[.2,.32,.66]);
+  q(()=>{
+    stroke([[150,150],[300,130],[450,170]],{w:34,prof:PROF.feather,col:[.975,.96,.925],col2:[1,1,.99],gradN:.5,thick:1.5,edge:.5,spec:.09,streak:.06,jit:.02});
+    stroke([[150,200],[300,190],[450,215]],{w:34,prof:PROF.feather,col:[.975,.96,.925],col2:[.8,.78,.84],grad:1,gradN:.5,thick:1.5,edge:.5,spec:.09,streak:.06,jit:.02});
+    stroke([[150,250],[300,230],[450,270]],{w:30,prof:PROF.feather,col:[.035,.04,.055],col2:[.14,.18,.27],grad:1,gradN:.6,thick:.55,spec:.22,streak:.3,jit:.1});
+    stroke([[150,300],[300,290],[450,315]],{w:30,prof:PROF.feather,col:[.035,.04,.055],col2:[.14,.18,.27],grad:1,gradN:.6,thick:.6,spec:.24,streak:.35,jit:.12,dry:.42,load:160,tone2:.5});
+    stroke([[150,350],[450,370]],{w:26,flat:true,prof:'flat',rag:5,col:[.1,.22,.58],col2:[.4,.55,.9],gradN:1,dry:.75,load:260,thick:.5,spec:.2,streak:.3});
+    for(let i=0;i<60;i++){const h=175+R(-30,70);stroke(arc(170+R(0,260),410+R(0,50),R(-.4,.4),R(20,45),R(-.5,.5),5),{w:R(7,14),prof:PROF.feather,col:hsv(h,.7,.42),col2:hsv(h+35,.45,.75),gradN:1,a:.85,dry:.8,load:45,thick:.45,irid:.9,hue:h,spec:.3,streak:.4})}
+    pen([[150,500],[250,490],[350,510],[450,495]],{w:1.3});pen([[150,520],[450,525]],{w:2.2});
+    for(let i=0;i<30;i++)stroke(arc(160+i*9,560,1.2+R(-.2,.2),R(20,40),R(-.4,.4),4),{w:R(1,2.2),prof:'hair',col:[.03,.035,.05],a:.9,thick:.3,spec:.15});
+    disc(700,150,14,[.065,.042,.03],{thick:5*HS,base:.6,spec:.8});disc(696,146,3,[1,1,.98],{soft:.3});
+  });
+  paintLeaf(620,430,-.6,80,32,[[.36,.5,.29],[.56,.67,.4],[.2,.3,.17]]);
+}
+
+/* ---------- runner ---------- */
+let idx=0,raf=0,gen=0,fast=false,done=false;
+const mc=new MessageChannel();let pump=null;mc.port1.onmessage=()=>{if(pump)pump()};
+function finish(){relight(0,0,W-1,H-1);dirty.fill(0);if(!qs.has('raw'))photoFinish();done=true;st.textContent='finished';document.title='Magpie Marginalia ✓'}
+function start(isFast){gen++;const g=gen;cancelAnimationFrame(raf);seed=20261111;Q=[];done=false;fast=!!isFast;document.title='Magpie Marginalia';
+  CR.fill(.93);CG.fill(.873);CB.fill(.748);HT.fill(0);SP.fill(.03);MT.fill(0);IR.fill(0);PAPER.fill(.5);dirty.fill(0);ctx.fillStyle='#ecdfc0';ctx.fillRect(0,0,W,H);
+  if(qs.has('test'))testScene();else compose();idx=0;
+  const T0=performance.now(),TARGET=45000,due=()=>Math.ceil(Q.length*(performance.now()-T0)/TARGET)+1;
+  // paced by the clock rather than by animation frames, so it keeps the same speed even where frames are throttled
+  const step=()=>{if(g!==gen)return;const t0=performance.now();
+    if(fast){while(idx<Q.length&&performance.now()-t0<70)Q[idx++]()}
+    else{const allow=due();while(idx<Q.length&&idx<allow&&performance.now()-t0<18)Q[idx++]();flushDirty(90)}
+    st.textContent=`${stageName} — ${Math.round(idx/Q.length*100)}%`;
+    if(idx<Q.length){if(fast||idx<due())mc.port2.postMessage(0);else setTimeout(()=>{if(g===gen&&!fast)step()},24)}
+    else{finish();console.log('painted in',Math.round(performance.now()-T0),'ms,',Q.length,'ops')}};
+  pump=step;step()}
+document.getElementById('replay').onclick=()=>start(false);
+document.getElementById('skip').onclick=()=>{if(!done&&!fast){fast=true;mc.port2.postMessage(0)}};
+document.getElementById('save').onclick=()=>cv.toBlob(b=>{const a=document.createElement('a');a.download='magpie-marginalia.png';a.href=URL.createObjectURL(b);a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000)},'image/png');
+start(qs.has('instant')||location.hash==='#instant');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PaintSim Player</title>
+<style>
+  :root{--bg:#191715;--panel:#23201d;--line:#3a352f;--ink:#e8dfcc;--dim:#a0978a;--acc:#d9b25a}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{border-bottom:1px solid var(--line);padding:9px 16px;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+  h1{font:600 15px/1.2 Georgia,"Times New Roman",serif;margin:0 6px 0 0}
+  button,select,.chip{font:inherit;color:var(--ink);background:#2c2823;border:1px solid #4a4237;border-radius:4px;padding:3px 9px;cursor:pointer}
+  button:hover,.chip:hover{background:#3a342c}
+  #status{color:var(--dim);margin-left:auto}
+  main{padding:10px 16px 60px;max-width:1280px;margin:0 auto}
+  #note{color:var(--dim);margin:0 0 8px;max-width:90ch}
+  #stages{display:flex;flex-wrap:wrap;gap:5px;margin:0 0 10px}
+  .chip.on{border-color:var(--acc);color:var(--acc)}.chip.past{color:var(--dim)}
+  canvas{display:block;width:100%;height:auto;max-height:82vh;object-fit:contain;background:#23201d;border:1px solid var(--line);border-radius:6px}
+  #problems{white-space:pre-wrap;color:#e08a6a;background:var(--panel);border:1px solid #6b3a2a;border-radius:6px;padding:10px 12px;margin:0 0 10px}
+  details{margin-top:14px}summary{cursor:pointer;color:var(--acc);font:600 14px/1.2 Georgia,serif}
+  textarea{width:100%;min-height:340px;margin-top:8px;background:#171513;color:#d9d0bd;border:1px solid var(--line);border-radius:4px;padding:8px;font:11.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical}
+  body.drop canvas{border-color:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">PaintSim player</h1>
+  <button id="again">Paint again</button>
+  <button id="skip">Skip to the end</button>
+  <label>Light <select id="light"></select></label>
+  <label>Size <select id="scale"><option value="1">1×</option><option value="2" selected>2×</option><option value="3">3×</option><option value="4">4×</option></select></label>
+  <button id="save">Save PNG</button>
+  <button id="open">Open a painting…</button><input id="file" type="file" accept=".json,application/json" hidden>
+  <span id="status"></span>
+</header>
+<main>
+  <p id="note"></p>
+  <div id="stages"></div>
+  <pre id="problems" hidden></pre>
+  <canvas id="cv" width="16" height="16"></canvas>
+  <details>
+    <summary>The painting as data</summary>
+    <textarea id="json" spellcheck="false"></textarea>
+    <div style="margin-top:6px"><button id="apply">Paint this</button> <span style="color:var(--dim)">Edit the text and paint it; or drop a .json file anywhere on the page.</span></div>
+  </details>
+</main>
+<script src="paintsim.js"></script>
+<script src="paintsim.recipes.js"></script>
+<script src="paintsim.painting.js"></script>
+<script>
+(()=>{
+'use strict';
+const P=PaintSim,$=s=>document.querySelector(s),cv=$('#cv');
+const tick=()=>new Promise(r=>{const c=new MessageChannel();c.port1.onmessage=()=>r();c.port2.postMessage(0)});   // not slowed down in a background tab
+const status=t=>{$('#status').textContent=t};
+let doc=null,player=null,token=0;
+
+const lsel=$('#light');for(const n of['(as painted)'].concat(Object.keys(P.lights))){const o=document.createElement('option');o.textContent=n;lsel.appendChild(o)}
+const lightOf=()=>lsel.value==='(as painted)'?undefined:lsel.value;
+
+function problems(list){const el=$('#problems');el.hidden=!list.length;el.textContent=list.length?list.length+' problem'+(list.length>1?'s':'')+' in this painting\n  - '+list.join('\n  - '):''}
+function stages(){const box=$('#stages');box.textContent='';player.stages.forEach((s,i)=>{const b=document.createElement('button');b.className='chip';b.textContent=s.name;b.title='Show the painting as it stood after this stage';b.onclick=()=>play({instant:true,upTo:i});box.appendChild(b)})}
+function mark(){const cur=player.done?-1:player.stage;[...$('#stages').children].forEach((b,i)=>{b.classList.toggle('on',i===cur);b.classList.toggle('past',cur>=0&&i<cur)})}
+
+// paint the current painting: watched (about six seconds for the whole of it) or at once
+async function play(o){o=o||{};const my=++token;if(!doc)return;
+  const pr=P.check(doc);problems(pr);if(pr.length){status('not painted');return}
+  try{player=P.open(doc,{canvas:cv,scale:+$('#scale').value,light:lightOf(),upTo:o.upTo,unchecked:true})}catch(e){problems([e.message]);return}
+  $('#title').textContent=doc.title||'Untitled';$('#note').textContent=doc.note||'';document.title=(doc.title||'Untitled')+' — PaintSim';
+  if(o.upTo===undefined)stages();player.surface.render();const t0=performance.now(),want=o.instant?0:Math.min(6000,400+player.total*40);
+  try{while(!player.done){if(my!==token)return;
+      if(want){const due=Math.ceil((performance.now()-t0)/want*player.total);while(player.at<due&&player.next());}else player.runFor(40);
+      player.surface.flush();mark();status('step '+player.at+' of '+player.total);await tick()}}
+  catch(e){problems([e.message]);status('stopped');return}
+  if(my!==token)return;player.surface.render();mark();
+  status(player.total+' steps · '+cv.width+'×'+cv.height+' · '+((performance.now()-t0)/1000).toFixed(1)+' s'+(o.upTo!==undefined?' · after “'+player.stages[player.stages.length-1].name+'”':''))}
+
+function load(text,from){let d;try{d=JSON.parse(text)}catch(e){problems(['not valid JSON: '+e.message]);status(from||'');return}
+  doc=d;$('#json').value=text;play()}
+
+$('#again').onclick=()=>play();
+$('#skip').onclick=()=>play({instant:true});
+$('#scale').onchange=()=>play({instant:true});
+lsel.onchange=()=>{if(player&&player.done)player.surface.light(lightOf()||doc.light||'raking').render();else play({instant:true})};
+$('#apply').onclick=()=>load($('#json').value,'edited');
+$('#save').onclick=()=>cv.toBlob(b=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=((doc&&doc.title)||'painting').replace(/[^\w\- ]+/g,'').trim().replace(/\s+/g,'-').toLowerCase()+'.png';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)},'image/png');
+$('#open').onclick=()=>$('#file').click();
+$('#file').onchange=e=>{const f=e.target.files[0];if(f)f.text().then(t=>load(t,f.name))};
+addEventListener('dragover',e=>{e.preventDefault();document.body.classList.add('drop')});
+addEventListener('dragleave',()=>document.body.classList.remove('drop'));
+addEventListener('drop',e=>{e.preventDefault();document.body.classList.remove('drop');const f=e.dataTransfer.files[0];if(f)f.text().then(t=>load(t,f.name))});
+
+// which painting: ?doc=some.json, or the one built into a standalone copy of this page, or the sample
+const want=new URLSearchParams(location.search).get('doc'),built=document.getElementById('built-in');
+if(!want&&built)load(built.textContent,'built in');
+else{const url=want||'paintings/hills.json';status('loading '+url+'…');fetch(url).then(r=>{if(!r.ok)throw new Error(r.status+' '+r.statusText);return r.text()}).then(t=>load(t,url),e=>{problems(['could not load '+url+': '+e.message]);status('')})}
+window.PaintPlayer={get player(){return player},get painting(){return doc},play,load};
+})();
+</script>
+</body>
+</html>

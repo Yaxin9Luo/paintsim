@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PaintSim example</title>
+<style>html,body{margin:0;background:#191715}canvas{display:block;margin:24px auto;max-width:calc(100% - 32px);height:auto}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="paintsim.js"></script>
+<script src="paintsim.recipes.js"></script>
+<script>
+  const s = PaintSim.create({canvas: document.getElementById('c'), width: 400, height: 300, scale: 2, ground: 'toned panel', seed: 7});
+  s.fill({material: 'gold leaf', shape: [[40,40],[160,40],[160,120],[40,120]]});
+  s.paint({material: 'oil', brush: 'flat', width: 30, path: [[30,200],[200,180],[370,210]]});
+  s.paint({material: {base: 'oil', color: {mix: {ultramarine: 1, 'cadmium yellow': 2}}}, brush: 'round', width: 22, path: [[60,262],[200,232],[340,268]]});
+  s.paint({material: 'iron gall ink', brush: 'pen', path: [[200,60],[240,90],[280,50],[330,95]]});
+  s.render();
+</script>
+</body>
+</html>
