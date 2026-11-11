@@ -1,5 +1,3 @@
 .DS_Store
 .claude/
 node_modules/
-# paintings that are still being painted
-paintsim/paintings/lemons.*

@@ -15,7 +15,11 @@ The model gets a prompt ("a fishing harbour at sunset, impasto, palette knife…
 
 *Peonies in a celadon vase*: 1,924 marks
 
-All five were painted by Claude Fable 5.2.
+![Lemons](paintsim/paintings/lemons.png)
+
+*Lemons and a porcelain bowl*: 12,064 marks
+
+All six were painted by Claude Fable 5.2.
 
 ## What is measured
 
@@ -73,7 +77,7 @@ python3 -m http.server 8765   # then open http://localhost:8765/play.html?doc=pa
 
 ## Status
 
-- Five tasks. Four have a finished painting in `paintsim/paintings/` (the fifth, the lemons, is being painted; the magpie is not one of the tasks). Those were made with longer instructions than the task text in `bench/TASK.md`.
+- Five tasks. All five have a finished painting in `paintsim/paintings/` (the magpie is not one of the tasks). Those were made with longer instructions than the task text in `bench/TASK.md`.
 - One run with the task text alone: [`bench/runs/harbour-short-task/`](bench/runs/harbour-short-task/). A fresh Claude Fable 5.2 agent got a clean kit and the harbour task, nothing else. It delivered a sound document of 16,293 marks in 15 stages after about 23 minutes, 63 tool calls and about 232,000 tokens. That is one run of one task; it shows the task text is enough for this model, not how often.
 
   ![Harbour, from the task text alone](bench/runs/harbour-short-task/harbour.png)
